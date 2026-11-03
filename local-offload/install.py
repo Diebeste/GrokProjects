@@ -14,6 +14,7 @@ calls them. --setup is for after the user says yes.
 from __future__ import annotations
 
 import argparse
+import os
 import platform
 import shutil
 import subprocess
@@ -173,12 +174,30 @@ class LiveSetup:
     def which(self, name: str):
         return shutil.which(name)
 
+    def is_file(self, path: Path) -> bool:
+        return Path(path).is_file()
+
+    def home_dir(self) -> Path:
+        return Path.home()
+
+    def localappdata(self) -> str | None:
+        value = os.environ.get("LOCALAPPDATA")
+        if value:
+            return value
+        return None
+
     def run(self, argv: list[str]) -> None:
         sys.stdout.write("setup: " + " ".join(argv) + "\n")
         sys.stdout.flush()
         completed = subprocess.run(argv, check=False)
         if completed.returncode != 0:
             raise SystemExit(f"command failed ({completed.returncode}): {argv[0]}")
+
+    def try_run(self, argv: list[str]) -> int:
+        sys.stdout.write("setup: " + " ".join(argv) + "\n")
+        sys.stdout.flush()
+        completed = subprocess.run(argv, check=False)
+        return completed.returncode
 
     def spawn(self, argv: list[str]) -> None:
         sys.stdout.write("setup: start " + " ".join(argv) + "\n")
@@ -221,6 +240,40 @@ class LiveSetup:
             return 0, ""
 
 
+OLLAMA_HEALTH_URL = "http://127.0.0.1:11434/api/tags"
+OLLAMA_POLL_SECONDS = 30.0
+OLLAMA_POLL_INTERVAL = 0.5
+OLLAMA_MISSING = (
+    "ollama was not found. Checked PATH, "
+    "/Applications/Ollama.app/Contents/Resources/ollama, "
+    "~/Applications/Ollama.app/Contents/Resources/ollama, "
+    "/usr/local/bin/ollama, /opt/homebrew/bin/ollama, "
+    "and %LOCALAPPDATA%\\Programs\\Ollama\\ollama.exe."
+)
+
+
+def ollama_search_paths(home: Path, localappdata: str | None) -> list[Path]:
+    paths = [
+        Path("/Applications/Ollama.app/Contents/Resources/ollama"),
+        Path(home) / "Applications" / "Ollama.app" / "Contents" / "Resources" / "ollama",
+        Path("/usr/local/bin/ollama"),
+        Path("/opt/homebrew/bin/ollama"),
+    ]
+    if localappdata:
+        paths.append(Path(localappdata) / "Programs" / "Ollama" / "ollama.exe")
+    return paths
+
+
+def find_ollama(which, is_file, home: Path, localappdata: str | None = None) -> str:
+    found = which("ollama")
+    if found:
+        return found
+    for candidate in ollama_search_paths(home, localappdata):
+        if is_file(candidate):
+            return str(candidate)
+    raise SystemExit(OLLAMA_MISSING)
+
+
 def install_argv(system: str, which) -> list[str]:
     if system == "Darwin":
         if which("brew"):
@@ -238,12 +291,32 @@ def recommended_model(config: dict, memory_gb, server_name: str) -> str:
     return str(rung["tag"])
 
 
-def _wait_until(predicate, attempts: int, sleep) -> bool:
-    for _ in range(attempts):
+def _wait_until(predicate, timeout: float, sleep, interval: float = OLLAMA_POLL_INTERVAL) -> bool:
+    waited = 0.0
+    while waited < timeout:
         if predicate():
             return True
-        sleep(0.25)
-    return False
+        sleep(interval)
+        waited += interval
+    return bool(predicate())
+
+
+def start_ollama(host, binary: str) -> None:
+    if host.system() == "Darwin":
+        if host.try_run(["open", "-a", "Ollama"]) == 0 and _wait_until(
+            lambda: host.healthy(OLLAMA_HEALTH_URL),
+            OLLAMA_POLL_SECONDS,
+            host.sleep,
+        ):
+            return
+        sys.stdout.write("setup: Ollama.app did not open the server; starting the binary\n")
+        sys.stdout.flush()
+    host.spawn([binary, "serve"])
+    if not _wait_until(lambda: host.healthy(OLLAMA_HEALTH_URL), OLLAMA_POLL_SECONDS, host.sleep):
+        raise SystemExit(
+            f"ollama did not start. {binary} serve did not answer http://127.0.0.1:11434 "
+            f"within {OLLAMA_POLL_SECONDS:g}s."
+        )
 
 
 def perform_setup(server_name: str, home: Path, host: LiveSetup | None = None) -> str:
@@ -265,16 +338,15 @@ def perform_setup(server_name: str, home: Path, host: LiveSetup | None = None) -
         host.run([sys.executable, "-c", code])
         if not host.healthy("http://127.0.0.1:8080/v1/models"):
             host.spawn([sys.executable, "-m", "mlx_lm.server", "--host", "127.0.0.1", "--port", "8080"])
-            _wait_until(lambda: host.healthy("http://127.0.0.1:8080/v1/models"), 20, host.sleep)
+            _wait_until(lambda: host.healthy("http://127.0.0.1:8080/v1/models"), OLLAMA_POLL_SECONDS, host.sleep)
     else:
         host.run(install_argv(system, host.which))
-        if not host.healthy("http://127.0.0.1:11434/api/tags"):
-            host.spawn(["ollama", "serve"])
-            if not _wait_until(lambda: host.healthy("http://127.0.0.1:11434/api/tags"), 40, host.sleep):
-                raise SystemExit("ollama did not start")
+        binary = find_ollama(host.which, host.is_file, host.home_dir(), host.localappdata())
+        if not host.healthy(OLLAMA_HEALTH_URL):
+            start_ollama(host, binary)
         sys.stdout.write(f"setup: pulling {model}\n")
         sys.stdout.flush()
-        host.run(["ollama", "pull", model])
+        host.run([binary, "pull", model])
     return _verify_tier(home, host)
 
 
@@ -293,7 +365,8 @@ def perform_pull(home: Path, host: LiveSetup | None = None, discover=None) -> No
         return
     if found.name != "ollama" and found.api != "ollama":
         raise SystemExit(f"{found.name} is running; load {model} in that app")
-    host.run(["ollama", "pull", model])
+    binary = find_ollama(host.which, host.is_file, host.home_dir(), host.localappdata())
+    host.run([binary, "pull", model])
 
 
 def _verify_tier(home: Path, host: LiveSetup) -> str:

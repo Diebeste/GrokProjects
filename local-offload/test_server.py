@@ -971,11 +971,38 @@ class InstallTests(unittest.TestCase):
     def test_setup_uses_the_fake_runner(self) -> None:
         host = _FakeSetup("Linux", "x86_64")
         body = project_install.perform_setup("ollama", self.home, host)
+        binary = "/usr/local/bin/ollama"
         self.assertIn("https://ollama.com/install.sh", " ".join(host.commands[0]))
-        self.assertEqual(host.commands[-1][:2], ["ollama", "pull"])
+        self.assertEqual(host.spawned, [[binary, "serve"]])
+        self.assertEqual(host.commands[-1][:2], [binary, "pull"])
         self.assertIn("qwen2.5-coder", host.commands[-1][-1])
-        self.assertIn("ollama", host.spawned[0])
+        self.assertNotIn(["open", "-a", "Ollama"], host.commands)
         self.assertIn("qwen2.5-coder", body)
+
+    def test_macos_opens_the_app_and_pulls_with_the_bundle_binary(self) -> None:
+        app = "/Applications/Ollama.app/Contents/Resources/ollama"
+        host = _FakeSetup("Darwin", "arm64", ollama_path=None, files=[app], healthy_after_open=True)
+        project_install.perform_setup("ollama", self.home, host)
+        self.assertIn("Ollama-darwin.zip", " ".join(host.commands[0]))
+        self.assertEqual(host.commands[1], ["open", "-a", "Ollama"])
+        self.assertEqual(host.commands[-1][:2], [app, "pull"])
+        self.assertEqual(host.spawned, [])
+
+    def test_macos_falls_back_to_the_bundle_binary_when_open_fails(self) -> None:
+        app = "/Applications/Ollama.app/Contents/Resources/ollama"
+        host = _FakeSetup("Darwin", "arm64", ollama_path=None, files=[app], open_code=1)
+        project_install.perform_setup("ollama", self.home, host)
+        self.assertEqual(host.commands[1], ["open", "-a", "Ollama"])
+        self.assertEqual(host.spawned, [[app, "serve"]])
+        self.assertEqual(host.commands[-1][:2], [app, "pull"])
+
+    def test_setup_errors_when_the_binary_is_missing(self) -> None:
+        host = _FakeSetup("Darwin", "arm64", ollama_path=None)
+        with self.assertRaises(SystemExit) as caught:
+            project_install.perform_setup("ollama", self.home, host)
+        self.assertIn("ollama was not found", str(caught.exception))
+        self.assertIn("Ollama.app", str(caught.exception))
+        self.assertEqual(host.spawned, [])
 
     def test_mlx_setup_is_apple_silicon_only(self) -> None:
         host = _FakeSetup("Darwin", "arm64")
@@ -988,11 +1015,28 @@ class InstallTests(unittest.TestCase):
 
 
 class _FakeSetup:
-    def __init__(self, system: str, arch: str) -> None:
+    def __init__(
+        self,
+        system: str,
+        arch: str,
+        ollama_path: str | None = "/usr/local/bin/ollama",
+        files=None,
+        open_code: int = 0,
+        healthy_after_open: bool = False,
+        localappdata: str | None = None,
+        home: str = "/Users/tester",
+    ) -> None:
         self._system = system
         self._arch = arch
+        self._ollama_path = ollama_path
+        self._files = {Path(path) for path in (files or [])}
+        self._open_code = open_code
+        self._healthy_after_open = healthy_after_open
+        self._localappdata = localappdata
+        self._home = Path(home)
         self.commands = []
         self.spawned = []
+        self.opened = False
 
     def system(self) -> str:
         return self._system
@@ -1001,10 +1045,27 @@ class _FakeSetup:
         return self._arch
 
     def which(self, name: str):
+        if name == "ollama":
+            return self._ollama_path
         return None
+
+    def is_file(self, path: Path) -> bool:
+        return Path(path) in self._files
+
+    def home_dir(self) -> Path:
+        return self._home
+
+    def localappdata(self) -> str | None:
+        return self._localappdata
 
     def run(self, argv: list) -> None:
         self.commands.append(list(argv))
+
+    def try_run(self, argv: list) -> int:
+        self.commands.append(list(argv))
+        if list(argv)[:3] == ["open", "-a", "Ollama"] and self._open_code == 0:
+            self.opened = True
+        return self._open_code
 
     def spawn(self, argv: list) -> None:
         self.spawned.append(list(argv))
@@ -1013,6 +1074,8 @@ class _FakeSetup:
         return 16.0
 
     def healthy(self, url: str) -> bool:
+        if self.opened and self._healthy_after_open:
+            return True
         return bool(self.spawned)
 
     def sleep(self, seconds: float) -> None:
@@ -1020,6 +1083,81 @@ class _FakeSetup:
 
     def fetch_tier(self, url: str):
         return 200, '{"model":"qwen2.5-coder:14b"}'
+
+
+class _NamedBackend:
+    def __init__(self, name: str, api: str) -> None:
+        self.name = name
+        self.api = api
+
+
+class OllamaBinaryTests(unittest.TestCase):
+    def test_path_wins_over_later_files(self) -> None:
+        seen = []
+
+        def is_file(path: Path) -> bool:
+            seen.append(Path(path))
+            return True
+
+        found = project_install.find_ollama(
+            lambda name: "/opt/homebrew/bin/ollama" if name == "ollama" else None,
+            is_file,
+            Path("/Users/brand"),
+            "C:/Users/brand/AppData/Local",
+        )
+        self.assertEqual(found, "/opt/homebrew/bin/ollama")
+        self.assertEqual(seen, [])
+
+    def test_search_order_and_each_hit(self) -> None:
+        home = Path("/Users/brand")
+        local = "C:/Users/brand/AppData/Local"
+        expected = project_install.ollama_search_paths(home, local)
+        self.assertEqual(
+            [path.name for path in expected],
+            ["ollama", "ollama", "ollama", "ollama", "ollama.exe"],
+        )
+        self.assertEqual(expected[0], Path("/Applications/Ollama.app/Contents/Resources/ollama"))
+        self.assertEqual(
+            expected[1],
+            home / "Applications" / "Ollama.app" / "Contents" / "Resources" / "ollama",
+        )
+        self.assertEqual(expected[2], Path("/usr/local/bin/ollama"))
+        self.assertEqual(expected[3], Path("/opt/homebrew/bin/ollama"))
+        self.assertEqual(expected[4], Path(local) / "Programs" / "Ollama" / "ollama.exe")
+        for chosen in expected:
+            def is_file(path: Path, chosen: Path = chosen) -> bool:
+                return Path(path) == chosen
+
+            found = project_install.find_ollama(lambda name: None, is_file, home, local)
+            self.assertEqual(found, str(chosen))
+
+    def test_missing_binary_names_every_location(self) -> None:
+        with self.assertRaises(SystemExit) as caught:
+            project_install.find_ollama(
+                lambda name: None,
+                lambda path: False,
+                Path("/Users/brand"),
+                None,
+            )
+        message = str(caught.exception)
+        self.assertIn("ollama was not found", message)
+        self.assertIn("/Applications/Ollama.app/Contents/Resources/ollama", message)
+        self.assertIn("~/Applications/Ollama.app/Contents/Resources/ollama", message)
+        self.assertIn("/usr/local/bin/ollama", message)
+        self.assertIn("/opt/homebrew/bin/ollama", message)
+        self.assertIn("ollama.exe", message)
+
+    def test_windows_pull_uses_localappdata_when_path_is_stale(self) -> None:
+        local = "C:/Users/brand/AppData/Local"
+        binary = Path(local) / "Programs" / "Ollama" / "ollama.exe"
+        host = _FakeSetup("Windows", "AMD64", ollama_path=None, files=[binary], localappdata=local)
+        project_install.perform_pull(
+            Path("/tmp/unused"),
+            host,
+            discover=lambda config: _NamedBackend("ollama", "ollama"),
+        )
+        self.assertEqual(host.commands, [[str(binary), "pull", "qwen2.5-coder:14b"]])
+        self.assertEqual(host.spawned, [])
 
 
 class SetupPayloadTests(unittest.TestCase):

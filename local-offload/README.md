@@ -71,7 +71,7 @@ The host asks the user the `setup.ask` string:
 
 `No local model found. Install <server> + <model> (~X GB)? [yes / not now / never]`
 
-- yes: `python3 install.py --setup`. macOS uses `brew install ollama` when Homebrew is present, otherwise the official Ollama.app zip. Windows runs the official `OllamaSetup.exe` installer. Linux runs `https://ollama.com/install.sh`. The command prints progress, pulls the recommended model, and verifies `GET /tier`. `python3 install.py --setup mlx` is the Apple Silicon alternative.
+- yes: `python3 install.py --setup`. macOS uses `brew install ollama` when Homebrew is present, otherwise the official Ollama.app zip. Windows runs the official `OllamaSetup.exe` installer. Linux runs `https://ollama.com/install.sh`. The command prints progress, pulls the recommended model, and verifies `GET /tier`. `python3 install.py --setup mlx` is the Apple Silicon alternative. The `ollama` binary is the first of: `PATH`, `/Applications/Ollama.app/Contents/Resources/ollama`, `~/Applications/Ollama.app/Contents/Resources/ollama`, `/usr/local/bin/ollama`, `/opt/homebrew/bin/ollama`, and on Windows `%LOCALAPPDATA%\Programs\Ollama\ollama.exe`. `pull` uses that full path. On macOS the server is started with `open -a Ollama`, then `127.0.0.1:11434` is polled; if the app does not answer, setup starts that binary with `serve`.
 - not now: the host does this task itself and asks again next session. Nothing is saved.
 - never: `python3 install.py --never` writes `{"neverAsk": true}` to `~/.local-offload/config`. Later 503 responses set `setup.ask` to null and `setup.neverAsk` to true, and the host stops asking.
 
