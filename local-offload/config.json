@@ -1,15 +1,33 @@
 {
   "bindHost": "127.0.0.1",
   "port": 8765,
-  "ollamaHost": "http://127.0.0.1:11434",
+  "baseUrl": "",
+  "backends": [
+    {"name": "ollama", "baseUrl": "http://127.0.0.1:11434"},
+    {"name": "lmstudio", "baseUrl": "http://127.0.0.1:1234"},
+    {"name": "llamacpp", "baseUrl": "http://127.0.0.1:8080"},
+    {"name": "mlx", "baseUrl": "http://127.0.0.1:8080"}
+  ],
   "fallbackRung": "7B",
   "lowBelowGb": 8,
   "highAboveGb": 16,
+  "maxAttempts": 5,
+  "attemptTimeoutSec": 120,
+  "overallTimeoutSec": 600,
+  "localReadChars": 200000,
   "limits": {
     "instructionChars": 4000,
     "testChars": 2000,
     "contextChars": 12000
   },
+  "allowedTestPrefixes": [
+    ["python3", "-m", "pytest"],
+    ["python3", "-m", "unittest"],
+    ["python", "-m", "pytest"],
+    ["python", "-m", "unittest"],
+    ["npm", "test"],
+    ["go", "test"]
+  ],
   "rungs": [
     {
       "parameterClass": "7B",
@@ -19,6 +37,9 @@
       "maxBillion": 9,
       "maxTokens": 1024,
       "tag": "qwen2.5-coder:7b",
+      "downloadGb": 4.7,
+      "mlxTag": "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit",
+      "mlxDownloadGb": 4.5,
       "instruction": "Generate exactly one short function; the host applies it and runs the test."
     },
     {
@@ -29,6 +50,9 @@
       "maxBillion": 16,
       "maxTokens": 4096,
       "tag": "qwen2.5-coder:14b",
+      "downloadGb": 9,
+      "mlxTag": "mlx-community/Qwen2.5-Coder-14B-Instruct-4bit",
+      "mlxDownloadGb": 8,
       "instruction": "Generate exactly one file; the host applies it and runs the test."
     },
     {
@@ -39,6 +63,9 @@
       "maxBillion": 36,
       "maxTokens": 8192,
       "tag": "qwen2.5-coder:32b",
+      "downloadGb": 19,
+      "mlxTag": "mlx-community/Qwen2.5-Coder-32B-Instruct-4bit",
+      "mlxDownloadGb": 18,
       "instruction": "Generate one multi-file change; the host applies it and runs the test."
     }
   ]

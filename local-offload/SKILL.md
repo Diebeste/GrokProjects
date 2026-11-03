@@ -1,19 +1,46 @@
 ---
 name: local-offload
-description: "Draft one bounded code slice on the local Ollama service at 127.0.0.1:8765. Use when the host already knows the slice (one short function, one file, or one multi-file change) and will apply the text and run a test the host defined. If that service is unreachable, do the work on the host."
+description: "Offload boilerplate, scaffolding, mechanical edits, and summaries to the local service at 127.0.0.1:8765. Use when a small local model can do the slice and you will apply the result. If no local backend is running, ask before any install. Keep open-ended design, debugging, and security-sensitive work on the host."
 ---
 
 # Local offload
 
-You assign a bounded slice to the local service, apply the text it returns, and run the test you defined. You keep the repository, credentials, and files. You keep open-ended design.
+You spend fewer paid tokens by sending bounded work to the user's local model. You keep the repository, credentials, and the final apply. The service does not write the real repo.
 
-The service generates text only. It has no tools and no filesystem.
+## What you offload
 
-## When the service is down
+Send work small models do well:
 
-Request `GET http://127.0.0.1:8765/tier`. Allow several minutes on the first call. That call can install Ollama and download the model.
+- boilerplate and repetitive glue
+- test scaffolding
+- docstrings and comments
+- mechanical renames and refactors
+- format conversions
+- summaries of large files or logs
 
-If the connection is refused, the request times out, or the status is not 200, install once when `~/.local-offload/server.py` is missing. Do not install a second time when that file is already there.
+For a summary, pass the file path. The local model reads the big text. You read only the summary it returns. Do not paste the file into the host context.
+
+## What you keep
+
+Keep open-ended design, debugging, and anything security-sensitive on the host. Do not send secrets, tokens, or `.env` files.
+
+## When no local model is running
+
+Request `GET http://127.0.0.1:8765/tier`.
+
+If the status is 503 and `setup.neverAsk` is true, do the work yourself and do not ask.
+
+If `setup.ask` is a string, ask the user that exact question. It has this form:
+
+`No local model found. Install <server> + <model> (~X GB)? [yes / not now / never]`
+
+On Apple Silicon, `setup.alternatives` may list MLX. You may mention that option. The question you ask is still `setup.ask`.
+
+- yes: from `~/.local-offload`, run `python3 install.py --setup` (or `python3 install.py --setup mlx` when they chose MLX). It prints progress, installs the official package for this OS, pulls the model, and verifies `GET /tier`. Never install without the user's yes.
+- not now: do this task yourself. Do not save a flag. Ask again next session.
+- never: run `python3 install.py --never`. That writes `~/.local-offload/config` so later sessions do not ask. Then do the work yourself.
+
+If the connection is refused, install once when `~/.local-offload/server.py` is missing, start it, and request `/tier` again.
 
 From a git checkout the host already has:
 
@@ -27,18 +54,18 @@ When a repo URL exists:
 python3 install.py --repo <git-url>
 ```
 
-Then start the service and request `/tier` again:
+Then:
 
 ```bash
 cd ~/.local-offload
 python3 server.py
 ```
 
-If `~/.local-offload/server.py` was already installed, skip the installer and only start it, then request `/tier` again. If that request is still not 200, do the work yourself.
+If `~/.local-offload/server.py` was already installed, skip the installer and only start it. If `/tier` is still not 200 after the user declines setup, do the work yourself.
 
 ## Size the slice
 
-Read `slice`, `model`, `parameterClass`, and `instruction` from the JSON body.
+Read `slice`, `model`, `parameterClass`, `instruction`, and `needsPull` from the JSON body.
 
 | `slice` | What you send |
 | --- | --- |
@@ -46,30 +73,42 @@ Read `slice`, `model`, `parameterClass`, and `instruction` from the JSON body.
 | `file` | One file |
 | `multifile` | One multi-file change |
 
-If the task is larger than that slice, keep the rest and send one fitting slice, or do the whole task yourself. Follow the `instruction` line from `/tier`.
+If `needsPull` is true, the backend is up and the model is missing. Run `python3 install.py --pull` only after the user agrees, then request `/tier` again. Do not pull on your own.
 
-Define the test you will run before you POST. You run that test. The service does not run it.
+If the task is larger than that slice, keep the rest and send one fitting slice, or do the whole task yourself.
 
 ## POST the job
 
-`POST http://127.0.0.1:8765/job` with `Content-Type: application/json`:
+`POST http://127.0.0.1:8765/job` with `Content-Type: application/json`.
+
+Summary or one draft, with no test command:
 
 ```json
 {
-  "instruction": "Write a Python function add(a, b) that returns the sum of its arguments.",
-  "test": "add(1, 2) is 3 and add(-1, 1) is 0",
-  "context": "optional small excerpt you paste"
+  "instruction": "Summarize this log in one short paragraph.",
+  "files": ["logs/app.log"],
+  "repo": "/absolute/path/to/repo"
 }
 ```
 
-`instruction` is required. `test` is the test description you already defined. `context` is a small excerpt you paste. Leave secrets out. There is no API key.
+A 200 response is `text/plain`. Apply a code draft yourself. For a summary, read that text and do not open the whole file.
 
-A 200 response is `text/plain`: the generated slice and nothing else. If a single markdown fence wraps it, apply the fenced body. Apply it in the repo yourself, then run your test.
+Local test loop, when the model should iterate on a test:
 
-Any other status means you do the work yourself.
+```json
+{
+  "instruction": "Make add return the sum of its arguments.",
+  "files": ["src/add.py", "tests/test_add.py"],
+  "targets": ["src/add.py"],
+  "repo": "/absolute/path/to/repo",
+  "testCommand": ["python3", "-m", "pytest", "tests/test_add.py"]
+}
+```
 
-## One retry
+`testCommand` must be an argv array in the allow-list (`pytest`, `unittest`, `npm test`, `go test`). Do not send a shell string, network URLs, or secrets.
 
-If your test fails, POST `/job` once more. Keep the same slice. Put a short failure excerpt in `context`. If the second result fails the test, finish the work yourself. Do not send a third job.
+The service copies those files into a temp scratch dir, writes the model output there, runs the test with a timeout, and retries up to the configured cap (default 5) within an overall time limit. It never writes the real repo.
 
-You get one retry.
+A 200 JSON body has `ok`, `attempts`, `files`, `testOutput`, and `report`. If `ok` is true, write `files` into the repo yourself and rerun the test command once. If `ok` is false, or any other status, do the work yourself.
+
+You get one local loop per task. Do not start a second loop after a failure report.

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ast
 import http.client
 import json
 import os
@@ -23,25 +24,35 @@ from server import (
     AMD_VRAM_GLOB,
     CONFIG_PATH,
     DARWIN_RAM_COMMAND,
-    INSTALL_COMMAND,
     NVIDIA_COMMAND,
     WINDOWS_RAM_COMMAND,
+    Backend,
+    BackendClient,
+    CommandResult,
     InstalledModel,
+    JobError,
     LoopbackServer,
-    OllamaClient,
     Service,
     ServiceError,
+    ask_sentence,
     assert_loopback_bind,
     assert_loopback_url,
+    build_setup,
     chat_payload,
+    command_allowed,
     decode_ollama_body,
-    ensure_ollama,
+    endpoint_list,
     load_config,
     make_handler,
+    ollama_chat_payload,
     parse_billion,
     pick_model,
+    probe_backends,
     read_memory_gb,
+    read_never_ask,
     select_rung,
+    user_config_path,
+    write_never_ask,
 )
 
 
@@ -94,16 +105,21 @@ class FakeOllama:
         self.pulled = []
         self.generated = []
         self.error = None
+        self.name = "ollama"
+        self.api = "openai"
+        self.base_url = "http://127.0.0.1:11434"
 
     def list_models(self):
         return list(self.models)
 
     def pull(self, name: str) -> None:
         self.pulled.append(name)
-        self.models.append(InstalledModel(name, parse_billion(name)))
+        raise AssertionError("pull is not automatic")
 
-    def generate(self, model: str, prompt: str, max_tokens: int) -> str:
-        self.generated.append({"model": model, "prompt": prompt, "max_tokens": max_tokens})
+    def generate(self, model: str, prompt: str, max_tokens: int, summary: bool = False) -> str:
+        self.generated.append(
+            {"model": model, "prompt": prompt, "max_tokens": max_tokens, "summary": summary}
+        )
         if self.error:
             raise self.error
         return self.text
@@ -304,247 +320,181 @@ class LadderTests(unittest.TestCase):
         self.assertIsNone(parse_billion("qwen2"))
         self.assertIsNone(parse_billion(""))
 
-    def test_service_pulls_the_pinned_tag_and_caches_it(self) -> None:
+    def test_service_does_not_pull_when_the_model_is_missing(self) -> None:
         ollama = FakeOllama([])
-        service = Service(load_config(), lambda: 20.0, ollama, lambda: None)
+        service = Service(load_config(), lambda: 20.0, ollama)
         payload = service.tier()
         self.assertEqual(payload["slice"], "multifile")
         self.assertEqual(payload["model"], "qwen2.5-coder:32b")
-        self.assertEqual(ollama.pulled, ["qwen2.5-coder:32b"])
-        self.assertEqual(service.tier(), payload)
-        self.assertEqual(ollama.pulled, ["qwen2.5-coder:32b"])
+        self.assertTrue(payload["needsPull"])
+        self.assertEqual(payload["pull"], "python3 install.py --pull")
+        self.assertEqual(ollama.pulled, [])
+        self.assertTrue(service.tier()["needsPull"])
+        self.assertEqual(ollama.generated, [])
 
     def test_service_uses_an_installed_model_in_band(self) -> None:
         ollama = FakeOllama([InstalledModel("local-coder:14b", 14.2)])
-        service = Service(load_config(), lambda: 12.0, ollama, lambda: None)
+        service = Service(load_config(), lambda: 12.0, ollama)
         payload = service.tier()
         self.assertEqual(payload["model"], "local-coder:14b")
         self.assertEqual(payload["slice"], "file")
+        self.assertFalse(payload["needsPull"])
         self.assertEqual(ollama.pulled, [])
 
-    def test_service_memory_failure_pulls_7b_and_ignores_a_larger_model(self) -> None:
+    def test_unsized_installed_model_is_used(self) -> None:
+        ollama = FakeOllama([InstalledModel("local-model", None)])
+        service = Service(load_config(), lambda: 4.0, ollama)
+        payload = service.tier()
+        self.assertEqual(payload["model"], "local-model")
+        self.assertFalse(payload["needsPull"])
+
+    def test_service_memory_failure_does_not_pull(self) -> None:
         ollama = FakeOllama([InstalledModel("qwen2.5-coder:32b", 32.8)])
-        service = Service(load_config(), lambda: None, ollama, lambda: None)
+        service = Service(load_config(), lambda: None, ollama)
         payload = service.tier()
         self.assertEqual(payload["parameterClass"], "7B")
         self.assertEqual(payload["slice"], "function")
-        self.assertEqual(ollama.pulled, ["qwen2.5-coder:7b"])
+        self.assertTrue(payload["needsPull"])
+        self.assertEqual(ollama.pulled, [])
 
-    def test_memory_exception_pulls_7b(self) -> None:
+    def test_memory_exception_does_not_pull(self) -> None:
         def boom():
             raise RuntimeError("sysfs vanished")
 
         ollama = FakeOllama([InstalledModel("qwen2.5-coder:32b", 32.8)])
-        service = Service(load_config(), boom, ollama, lambda: None)
+        service = Service(load_config(), boom, ollama)
         payload = service.tier()
         self.assertEqual(payload["parameterClass"], "7B")
-        self.assertEqual(ollama.pulled, ["qwen2.5-coder:7b"])
+        self.assertTrue(payload["needsPull"])
+        self.assertEqual(ollama.pulled, [])
 
-    def test_pull_failure_is_not_cached_and_stays_on_7b(self) -> None:
-        class Boom(FakeOllama):
-            def pull(self, name: str) -> None:
-                self.pulled.append(name)
-                raise ServiceError("model pull failed")
-
-        ollama = Boom([])
-        service = Service(load_config(), lambda: None, ollama, lambda: None)
-        with self.assertRaises(ServiceError):
-            service.tier()
-        with self.assertRaises(ServiceError):
-            service.tier()
-        self.assertEqual(ollama.pulled, ["qwen2.5-coder:7b", "qwen2.5-coder:7b"])
-
-
-class EnsureTests(unittest.TestCase):
-    def test_healthy_daemon_skips_install_and_start(self) -> None:
-        calls = []
-        binary = ensure_ollama(
-            find=lambda: "/usr/bin/ollama",
-            install=lambda: calls.append("install"),
-            start=lambda binary: calls.append("start"),
-            healthy=lambda: True,
-            sleep=lambda seconds: calls.append("sleep"),
-            attempts=3,
-        )
-        self.assertEqual(binary, "/usr/bin/ollama")
-        self.assertEqual(calls, [])
-
-    def test_existing_binary_is_started(self) -> None:
-        calls = []
-        state = {"up": False}
-
-        def start(binary: str) -> None:
-            calls.append(("start", binary))
-            state["up"] = True
-
-        binary = ensure_ollama(
-            find=lambda: "/usr/local/bin/ollama",
-            install=lambda: calls.append("install"),
-            start=start,
-            healthy=lambda: state["up"],
-            sleep=lambda seconds: calls.append("sleep"),
-            attempts=3,
-        )
-        self.assertEqual(binary, "/usr/local/bin/ollama")
-        self.assertEqual(calls, [("start", "/usr/local/bin/ollama")])
-
-    def test_missing_binary_installs_then_starts(self) -> None:
-        calls = []
-        state = {"binary": None, "up": False}
-
-        def install() -> None:
-            calls.append("install")
-            state["binary"] = "/usr/local/bin/ollama"
-
-        def start(binary: str) -> None:
-            calls.append(("start", binary))
-            state["up"] = True
-
-        binary = ensure_ollama(
-            lambda: state["binary"],
-            install,
-            start,
-            lambda: state["up"],
-            sleep=lambda seconds: None,
-            attempts=3,
-        )
-        self.assertEqual(binary, "/usr/local/bin/ollama")
-        self.assertEqual(calls, ["install", ("start", "/usr/local/bin/ollama")])
-
-    def test_installer_that_starts_the_daemon_is_not_started_again(self) -> None:
-        calls = []
-        state = {"binary": None, "up": False}
-
-        def install() -> None:
-            state["binary"] = "/usr/bin/ollama"
-            state["up"] = True
-
-        binary = ensure_ollama(
-            lambda: state["binary"],
-            install,
-            lambda binary: calls.append("start"),
-            lambda: state["up"],
-            sleep=lambda seconds: None,
-            attempts=3,
-        )
-        self.assertEqual(binary, "/usr/bin/ollama")
-        self.assertEqual(calls, [])
-
-    def test_failed_install_does_not_start(self) -> None:
-        calls = []
-
-        def install() -> None:
-            raise ServiceError("ollama install failed")
-
+    def test_job_does_not_pull_a_missing_model(self) -> None:
+        ollama = FakeOllama([])
+        service = Service(load_config(), lambda: None, ollama)
         with self.assertRaises(ServiceError) as caught:
-            ensure_ollama(
-                lambda: None,
-                install,
-                lambda binary: calls.append("start"),
-                lambda: False,
-                sleep=lambda seconds: None,
-                attempts=2,
-            )
-        self.assertEqual(str(caught.exception), "ollama install failed")
-        self.assertEqual(calls, [])
+            service.job({"instruction": "write add"})
+        self.assertEqual(caught.exception.status, 503)
+        self.assertEqual(str(caught.exception), "model is not installed")
+        self.assertEqual(ollama.pulled, [])
+        self.assertEqual(ollama.generated, [])
 
-    def test_install_without_a_binary_errors(self) -> None:
+
+class ProbeTests(unittest.TestCase):
+    def test_native_ollama_is_only_the_fallback(self) -> None:
         calls = []
-        with self.assertRaises(ServiceError) as caught:
-            ensure_ollama(
-                lambda: None,
-                lambda: calls.append("install"),
-                lambda binary: calls.append("start"),
-                lambda: False,
-                sleep=lambda seconds: None,
-                attempts=2,
-            )
-        self.assertEqual(str(caught.exception), "ollama install failed")
-        self.assertEqual(calls, ["install"])
 
-    def test_start_timeout(self) -> None:
-        sleeps = []
-        with self.assertRaises(ServiceError) as caught:
-            ensure_ollama(
-                lambda: "/usr/bin/ollama",
-                lambda: None,
-                lambda binary: None,
-                lambda: False,
-                sleep=lambda seconds: sleeps.append(seconds),
-                attempts=2,
-            )
-        self.assertEqual(str(caught.exception), "ollama is not running")
-        self.assertEqual(sleeps, [0.5, 0.5])
+        def fetch(method, url, payload=None, timeout=2):
+            calls.append(url)
+            if url == "http://127.0.0.1:11434/v1/models":
+                return 0, {}
+            if url == "http://127.0.0.1:11434/api/tags":
+                return 200, {"models": [{"name": "qwen2.5-coder:7b"}]}
+            return 0, {}
 
-    def test_install_command_is_the_official_script(self) -> None:
-        text = " ".join(INSTALL_COMMAND)
-        self.assertIn("https://ollama.com/install.sh", text)
-        self.assertNotIn("dxdiag", text.lower())
+        backend = probe_backends(endpoint_list(load_config()), fetch)
+        self.assertEqual(backend.name, "ollama")
+        self.assertEqual(backend.api, "ollama")
+        self.assertEqual(calls[0], "http://127.0.0.1:11434/v1/models")
+        self.assertEqual(calls[1], "http://127.0.0.1:11434/api/tags")
+
+    def test_user_base_url_is_probed_first(self) -> None:
+        cfg = load_config()
+        cfg["baseUrl"] = "http://127.0.0.1:1234"
+
+        def fetch(method, url, payload=None, timeout=2):
+            if url == "http://127.0.0.1:1234/v1/models":
+                return 200, {"data": [{"id": "local-model"}]}
+            return 0, {}
+
+        backend = probe_backends(endpoint_list(cfg), fetch)
+        self.assertEqual((backend.name, backend.api, backend.base_url), ("custom", "openai", "http://127.0.0.1:1234"))
+
+    def test_shared_port_is_probed_once(self) -> None:
+        seen = []
+
+        def fetch(method, url, payload=None, timeout=2):
+            seen.append(url)
+            if url == "http://127.0.0.1:8080/v1/models":
+                return 200, {"data": [{"id": "local"}]}
+            return 0, {}
+
+        backend = probe_backends(endpoint_list(load_config()), fetch)
+        self.assertEqual(backend.name, "llamacpp")
+        self.assertEqual(backend.api, "openai")
+        self.assertEqual(seen.count("http://127.0.0.1:8080/v1/models"), 1)
+
+    def test_no_backend_when_every_probe_fails(self) -> None:
+        def fetch(method, url, payload=None, timeout=2):
+            return 0, {}
+
+        self.assertIsNone(probe_backends(endpoint_list(load_config()), fetch))
+
+    def test_server_does_not_install_or_pull(self) -> None:
+        text = Path(server.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("def ensure_ollama", text)
+        self.assertNotIn("def install_ollama", text)
+        self.assertNotIn("INSTALL_COMMAND", text)
+        self.assertNotIn("perform_setup", text)
+        self.assertNotIn("/api/pull", text)
 
 
-class OllamaClientTests(unittest.TestCase):
+class BackendClientTests(unittest.TestCase):
     def test_chat_payload_has_no_tools(self) -> None:
         payload = chat_payload("qwen2.5-coder:7b", "write add", 128)
         self.assertEqual(payload["model"], "qwen2.5-coder:7b")
         self.assertIs(payload["stream"], False)
         self.assertNotIn("tools", payload)
-        self.assertNotIn("tools", payload["options"])
-        self.assertEqual(payload["options"]["num_predict"], 128)
+        self.assertEqual(payload["max_tokens"], 128)
         self.assertIn("no tools", payload["messages"][0]["content"])
+        native = ollama_chat_payload("qwen2.5-coder:7b", "write add", 128)
+        self.assertEqual(native["options"]["num_predict"], 128)
+        self.assertNotIn("tools", native)
+        self.assertNotIn("tools", native["options"])
 
-    def test_generate_sends_chat_without_tools(self) -> None:
-        client = OllamaClient("http://127.0.0.1:11434")
+    def test_openai_generate_posts_chat_completions(self) -> None:
         seen = {}
 
-        def _post(path, payload, timeout, failure, status=503):
-            seen["path"] = path
+        def fetch(method, url, payload=None, timeout=2):
+            seen["method"] = method
+            seen["url"] = url
             seen["payload"] = payload
-            seen["failure"] = failure
-            seen["status"] = status
-            return {"message": {"content": "abc"}}
+            return 200, {"choices": [{"message": {"content": "abc"}}]}
 
-        client._post = _post
-        self.assertEqual(client.generate("qwen2.5-coder:7b", "write add", 32), "abc")
-        self.assertEqual(seen["path"], "/api/chat")
-        self.assertEqual(seen["status"], 502)
+        client = BackendClient(Backend("lmstudio", "http://127.0.0.1:1234", "openai"), fetch)
+        self.assertEqual(client.generate("local", "write add", 32), "abc")
+        self.assertEqual(seen["url"], "http://127.0.0.1:1234/v1/chat/completions")
         self.assertNotIn("tools", seen["payload"])
         self.assertEqual(seen["payload"]["messages"][1]["content"], "write add")
+        self.assertEqual(seen["payload"]["max_tokens"], 32)
+
+    def test_ollama_native_generate_is_the_fallback(self) -> None:
+        seen = {}
+
+        def fetch(method, url, payload=None, timeout=2):
+            seen["url"] = url
+            seen["payload"] = payload
+            return 200, {"message": {"content": "abc"}}
+
+        client = BackendClient(Backend("ollama", "http://127.0.0.1:11434", "ollama"), fetch)
+        self.assertEqual(client.generate("qwen2.5-coder:7b", "write add", 32), "abc")
+        self.assertEqual(seen["url"], "http://127.0.0.1:11434/api/chat")
+        self.assertNotIn("tools", seen["payload"])
+        self.assertEqual(seen["payload"]["options"]["num_predict"], 32)
 
     def test_empty_generation_is_502(self) -> None:
-        client = OllamaClient("http://127.0.0.1:11434")
-        client._post = lambda *args, **kwargs: {"message": {"content": ""}}
+        def fetch(method, url, payload=None, timeout=2):
+            return 200, {"choices": [{"message": {"content": ""}}]}
+
+        client = BackendClient(Backend("lmstudio", "http://127.0.0.1:1234", "openai"), fetch)
         with self.assertRaises(ServiceError) as caught:
             client.generate("m", "p", 8)
         self.assertEqual(caught.exception.status, 502)
         self.assertEqual(str(caught.exception), "empty generation")
 
-    def test_pull_posts_the_tag_name(self) -> None:
-        client = OllamaClient("http://127.0.0.1:11434")
-        seen = {}
-
-        def _post(path, payload, timeout, failure, status=503):
-            seen["path"] = path
-            seen["payload"] = payload
-            return {"status": "success"}
-
-        client._post = _post
-        client.pull("qwen2.5-coder:7b")
-        self.assertEqual(seen["path"], "/api/pull")
-        self.assertEqual(seen["payload"], {"name": "qwen2.5-coder:7b", "stream": False})
-
-    def test_pull_error_body(self) -> None:
-        client = OllamaClient("http://127.0.0.1:11434")
-        client._post = lambda *args, **kwargs: {"error": "missing"}
-        with self.assertRaises(ServiceError) as caught:
-            client.pull("missing:7b")
-        self.assertEqual(str(caught.exception), "model pull failed")
-
     def test_list_models_prefers_parameter_size(self) -> None:
-        client = OllamaClient("http://127.0.0.1:11434")
-
-        def _get(path, timeout):
-            self.assertEqual(path, "/api/tags")
-            return {
+        def fetch(method, url, payload=None, timeout=2):
+            self.assertEqual(url, "http://127.0.0.1:11434/api/tags")
+            return 200, {
                 "models": [
                     {"name": "custom:latest", "details": {"parameter_size": "14.8B"}},
                     {"name": "qwen2.5-coder:7b", "details": {}},
@@ -553,12 +503,12 @@ class OllamaClientTests(unittest.TestCase):
                 ]
             }
 
-        client._get = _get
+        client = BackendClient(Backend("ollama", "http://127.0.0.1:11434", "ollama"), fetch)
         models = client.list_models()
-        self.assertEqual([(model.name, model.billion) for model in models], [
-            ("custom:latest", 14.8),
-            ("qwen2.5-coder:7b", 7.0),
-        ])
+        self.assertEqual(
+            [(model.name, model.billion) for model in models],
+            [("custom:latest", 14.8), ("qwen2.5-coder:7b", 7.0)],
+        )
 
     def test_decode_ollama_body(self) -> None:
         pretty = b'{\n  "message": {"content": "hi"}\n}\n'
@@ -579,13 +529,13 @@ class OllamaClientTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             assert_loopback_url("http://10.0.0.5:11434")
         with self.assertRaises(SystemExit):
-            OllamaClient("http://10.0.0.5:11434")
+            BackendClient(Backend("ollama", "http://10.0.0.5:11434", "ollama"))
 
 
 class HttpTests(unittest.TestCase):
     def setUp(self) -> None:
         self.ollama = FakeOllama([InstalledModel("qwen2.5-coder:7b", 7.6)])
-        self.service = Service(load_config(), lambda: 4.0, self.ollama, lambda: None)
+        self.service = Service(load_config(), lambda: 4.0, self.ollama)
         self.httpd = LoopbackServer(("127.0.0.1", 0), make_handler(self.service))
         self.port = self.httpd.server_address[1]
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
@@ -636,10 +586,12 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("application/json", ctype)
         payload = json.loads(data)
-        self.assertEqual(list(payload), ["model", "parameterClass", "slice", "instruction"])
+        for key in ("model", "parameterClass", "slice", "instruction", "backend", "api", "needsPull"):
+            self.assertIn(key, payload)
         self.assertEqual(payload["model"], "qwen2.5-coder:7b")
         self.assertEqual(payload["parameterClass"], "7B")
         self.assertEqual(payload["slice"], "function")
+        self.assertFalse(payload["needsPull"])
         self.assertNotIn("\n", payload["instruction"])
         self.assertIn("one short function", payload["instruction"])
         status, _, _ = self.request("GET", "/tier?x=1")
@@ -743,15 +695,57 @@ class HttpTests(unittest.TestCase):
         status, _, _ = self.request("POST", "/tier", b"{}", {"Content-Type": "application/json"})
         self.assertEqual(status, 404)
 
-    def test_tier_503_when_ollama_is_down(self) -> None:
-        def fail() -> None:
-            raise ServiceError("ollama is not running")
-
-        self.service.ensure = fail
+    def test_tier_503_includes_setup_and_does_not_install(self) -> None:
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        self.service.backend = None
+        self.service.discover = lambda: None
+        self.service.home = Path(home.name)
+        self.service.system = "Darwin"
+        self.service.arch = "arm64"
+        self.service.memory_gb = lambda: 16.0
+        self.service._tier = None
         status, ctype, data = self.request("GET", "/tier")
         self.assertEqual(status, 503)
         self.assertIn("application/json", ctype)
-        self.assertIn(b"ollama is not running", data)
+        payload = json.loads(data)
+        self.assertEqual(payload["error"], "no local backend found")
+        self.assertIn("Ollama.app", payload["hint"])
+        setup = payload["setup"]
+        self.assertEqual(setup["os"], "Darwin")
+        self.assertEqual(setup["arch"], "arm64")
+        self.assertEqual(setup["memoryGb"], 16)
+        self.assertEqual(setup["recommended"]["server"], "ollama")
+        self.assertEqual(setup["recommended"]["model"], "qwen2.5-coder:14b")
+        self.assertEqual(setup["recommended"]["downloadGb"], 9)
+        self.assertEqual(setup["ask"], ask_sentence("ollama", "qwen2.5-coder:14b", 9))
+        self.assertFalse(setup["neverAsk"])
+        self.assertEqual(setup["alternatives"][0]["server"], "mlx")
+        self.assertIn("python3 install.py --setup", setup["commands"]["setup"])
+        self.assertFalse(user_config_path(Path(home.name)).exists())
+        self.assertEqual(self.ollama.pulled, [])
+        self.assertEqual(self.ollama.generated, [])
+
+    def test_never_ask_suppresses_the_question(self) -> None:
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        write_never_ask(user_config_path(Path(home.name)))
+        self.service.backend = None
+        self.service.discover = lambda: None
+        self.service.home = Path(home.name)
+        self.service.system = "Linux"
+        self.service.arch = "x86_64"
+        self.service.memory_gb = lambda: 4.0
+        self.service._tier = None
+        status, _, data = self.request("GET", "/tier")
+        self.assertEqual(status, 503)
+        setup = json.loads(data)["setup"]
+        self.assertTrue(setup["neverAsk"])
+        self.assertIsNone(setup["ask"])
+        self.assertIn("install.sh", setup["hint"])
+        self.assertEqual(setup["recommended"]["model"], "qwen2.5-coder:7b")
+        self.assertEqual(setup["alternatives"], [])
+        self.assertTrue(read_never_ask(user_config_path(Path(home.name))))
 
     def test_generation_failure_is_502(self) -> None:
         self.ollama.error = ServiceError("generation failed", 502)
@@ -771,7 +765,16 @@ class ContractTests(unittest.TestCase):
         self.assertEqual([rung["parameterClass"] for rung in cfg["rungs"]], ["7B", "14B", "32B"])
         self.assertEqual(cfg["bindHost"], "127.0.0.1")
         self.assertEqual(cfg["port"], 8765)
-        self.assertEqual(cfg["ollamaHost"], "http://127.0.0.1:11434")
+        self.assertEqual(
+            [item["baseUrl"] for item in cfg["backends"]],
+            [
+                "http://127.0.0.1:11434",
+                "http://127.0.0.1:1234",
+                "http://127.0.0.1:8080",
+                "http://127.0.0.1:8080",
+            ],
+        )
+        self.assertEqual(cfg["maxAttempts"], 5)
         self.assertEqual(cfg["fallbackRung"], "7B")
         self.assertEqual(cfg["lowBelowGb"], 8)
         self.assertEqual(cfg["highAboveGb"], 16)
@@ -784,7 +787,12 @@ class ContractTests(unittest.TestCase):
         self.assertIn(f"127.0.0.1:{cfg['port']}", skill)
         for rung in cfg["rungs"]:
             self.assertIn(rung["slice"], skill)
-        self.assertIn("one retry", skill)
+        self.assertIn("no local model found", skill)
+        self.assertIn("not now", skill)
+        self.assertIn("never", skill)
+        self.assertIn("boilerplate", skill)
+        self.assertIn("summar", skill)
+        self.assertIn("python3 install.py --setup", skill)
         self.assertIn("do the work yourself", skill)
         self.assertIn("open-ended design", skill)
 
@@ -814,7 +822,10 @@ class ContractTests(unittest.TestCase):
         self.assertIn("/job", lowered)
         for slice_limit in ("function", "file", "multifile"):
             self.assertIn(slice_limit, lowered)
-        self.assertIn("one retry", lowered)
+        self.assertIn("no local model found", lowered)
+        self.assertIn("not now", lowered)
+        self.assertIn("never", lowered)
+        self.assertIn("boilerplate", lowered)
         self.assertIn("do the work yourself", lowered)
         self.assertIn("open-ended design", lowered)
         cursor = (CONFIG_PATH.parent / "SKILL.md").read_text(encoding="utf-8")
@@ -931,6 +942,299 @@ class InstallTests(unittest.TestCase):
             self.assertIn("python3 install.py --repo", text)
             self.assertIn("~/.local-offload", text)
             self.assertIn("python3 server.py", text)
+
+    def test_never_flag_is_saved(self) -> None:
+        completed = self._run("--never")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        path = self.home / ".local-offload" / "config"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        self.assertIs(data["neverAsk"], True)
+        self.assertIn("never-ask", completed.stdout)
+        self.assertFalse((self.home / ".local-offload" / "server.py").exists())
+
+    def test_setup_commands_match_the_os(self) -> None:
+        linux = project_install.install_argv("Linux", lambda name: None)
+        self.assertIn("https://ollama.com/install.sh", " ".join(linux))
+        darwin = project_install.install_argv("Darwin", lambda name: "/opt/homebrew/bin/brew")
+        self.assertEqual(darwin, ["brew", "install", "ollama"])
+        app = project_install.install_argv("Darwin", lambda name: None)
+        self.assertIn("Ollama-darwin.zip", " ".join(app))
+        windows = " ".join(project_install.install_argv("Windows", lambda name: None))
+        self.assertIn("OllamaSetup.exe", windows)
+        self.assertIn("https://ollama.com/download/OllamaSetup.exe", windows)
+
+    def test_pull_refuses_without_a_backend(self) -> None:
+        with self.assertRaises(SystemExit) as caught:
+            project_install.perform_pull(self.home, discover=lambda config: None)
+        self.assertIn("no local backend", str(caught.exception))
+
+    def test_setup_uses_the_fake_runner(self) -> None:
+        host = _FakeSetup("Linux", "x86_64")
+        body = project_install.perform_setup("ollama", self.home, host)
+        self.assertIn("https://ollama.com/install.sh", " ".join(host.commands[0]))
+        self.assertEqual(host.commands[-1][:2], ["ollama", "pull"])
+        self.assertIn("qwen2.5-coder", host.commands[-1][-1])
+        self.assertIn("ollama", host.spawned[0])
+        self.assertIn("qwen2.5-coder", body)
+
+    def test_mlx_setup_is_apple_silicon_only(self) -> None:
+        host = _FakeSetup("Darwin", "arm64")
+        project_install.perform_setup("mlx", self.home, host)
+        flat = " ".join(" ".join(cmd) for cmd in host.commands)
+        self.assertIn("mlx-lm", flat)
+        self.assertIn("mlx-community", flat)
+        with self.assertRaises(SystemExit):
+            project_install.perform_setup("mlx", self.home, _FakeSetup("Linux", "x86_64"))
+
+
+class _FakeSetup:
+    def __init__(self, system: str, arch: str) -> None:
+        self._system = system
+        self._arch = arch
+        self.commands = []
+        self.spawned = []
+
+    def system(self) -> str:
+        return self._system
+
+    def arch(self) -> str:
+        return self._arch
+
+    def which(self, name: str):
+        return None
+
+    def run(self, argv: list) -> None:
+        self.commands.append(list(argv))
+
+    def spawn(self, argv: list) -> None:
+        self.spawned.append(list(argv))
+
+    def memory_gb(self):
+        return 16.0
+
+    def healthy(self, url: str) -> bool:
+        return bool(self.spawned)
+
+    def sleep(self, seconds: float) -> None:
+        return None
+
+    def fetch_tier(self, url: str):
+        return 200, '{"model":"qwen2.5-coder:14b"}'
+
+
+class SetupPayloadTests(unittest.TestCase):
+    def test_ask_sentence_and_platform_variants(self) -> None:
+        cfg = load_config()
+        small = build_setup(cfg, "Linux", "x86_64", 4, False)
+        self.assertTrue(small["ask"].startswith("No local model found. Install ollama + qwen2.5-coder:7b "))
+        self.assertIn("(~4.7 GB)", small["ask"])
+        self.assertTrue(small["ask"].endswith("[yes / not now / never]"))
+        self.assertEqual(small["ask"], ask_sentence("ollama", "qwen2.5-coder:7b", 4.7))
+        mac = build_setup(cfg, "Darwin", "arm64", 32, False)
+        self.assertEqual(mac["recommended"]["model"], "qwen2.5-coder:32b")
+        self.assertEqual(mac["recommended"]["downloadGb"], 19)
+        self.assertEqual(mac["alternatives"][0]["server"], "mlx")
+        self.assertEqual(mac["commands"]["setup"], "python3 install.py --setup")
+        self.assertEqual(build_setup(cfg, "Darwin", "x86_64", 4, False)["alternatives"], [])
+        windows = build_setup(cfg, "Windows", "AMD64", None, False)
+        self.assertIn("Ollama installer", windows["hint"])
+        self.assertEqual(windows["recommended"]["parameterClass"], "7B")
+        self.assertIsNone(windows["memoryGb"])
+        silent = build_setup(cfg, "Linux", "x86_64", 4, True)
+        self.assertIsNone(silent["ask"])
+        self.assertTrue(silent["neverAsk"])
+
+    def test_never_flag_round_trip_keeps_other_keys(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = user_config_path(Path(tmp.name))
+        path.parent.mkdir(parents=True)
+        path.write_text('{"keep": 1}\n', encoding="utf-8")
+        write_never_ask(path)
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        self.assertIs(saved["neverAsk"], True)
+        self.assertEqual(saved["keep"], 1)
+        self.assertTrue(read_never_ask(path))
+        self.assertFalse(read_never_ask(path.parent / "missing"))
+
+
+class LoopTests(unittest.TestCase):
+    def _repo(self, root: Path) -> Path:
+        repo = root / "repo"
+        (repo / "src").mkdir(parents=True)
+        (repo / "src" / "add.py").write_text("def add(a, b):\n    return 0\n", encoding="utf-8")
+        (repo / "tests").mkdir()
+        (repo / "tests" / "test_add.py").write_text("def test_add():\n    assert True\n", encoding="utf-8")
+        return repo
+
+    def test_fake_model_passes_on_attempt_three(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        repo = self._repo(root)
+        original = (repo / "src" / "add.py").read_text(encoding="utf-8")
+        log = root / "log.jsonl"
+        ollama = FakeOllama(
+            [InstalledModel("qwen2.5-coder:7b", 7.6)],
+            "def add(a, b):\n    return a + b\n",
+        )
+        calls = {"n": 0}
+
+        def runner(argv, cwd, timeout, env):
+            calls["n"] += 1
+            calls["env"] = env
+            self.assertEqual(argv[:3], ["python3", "-m", "pytest"])
+            self.assertIn("return a + b", (cwd / "src" / "add.py").read_text(encoding="utf-8"))
+            self.assertEqual((repo / "src" / "add.py").read_text(encoding="utf-8"), original)
+            if calls["n"] < 3:
+                return CommandResult(1, "", "fail %s" % calls["n"], False)
+            return CommandResult(0, "passed", "", False)
+
+        os.environ["SECRET_TOKEN"] = "super-secret"
+        self.addCleanup(lambda: os.environ.pop("SECRET_TOKEN", None))
+        service = Service(load_config(), lambda: 4.0, ollama, runner=runner, log_path=log)
+        result = service.job(
+            {
+                "instruction": "Make add return the sum.",
+                "files": ["src/add.py", "tests/test_add.py"],
+                "targets": ["src/add.py"],
+                "repo": str(repo),
+                "testCommand": ["python3", "-m", "pytest", "tests/test_add.py"],
+            }
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["attempts"], 3)
+        self.assertFalse(result["timedOut"])
+        self.assertIn("return a + b", result["files"]["src/add.py"])
+        self.assertIn("passed", result["testOutput"])
+        self.assertEqual((repo / "src" / "add.py").read_text(encoding="utf-8"), original)
+        self.assertNotIn("SECRET_TOKEN", calls["env"])
+        self.assertNotIn("super-secret", " ".join(calls["env"].values()))
+        prompts = [item["prompt"] for item in ollama.generated]
+        self.assertEqual(len(prompts), 3)
+        self.assertIn("fail 1", prompts[1])
+        self.assertIn("fail 2", prompts[2])
+        lines = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([line["attempt"] for line in lines], [1, 2, 3])
+        self.assertEqual([line["ok"] for line in lines], [False, False, True])
+        self.assertIsInstance(lines[-1]["tokensSaved"], int)
+        logged = log.read_text(encoding="utf-8")
+        self.assertNotIn("return a + b", logged)
+        self.assertNotIn("super-secret", logged)
+
+    def test_command_timeout_returns_a_failure_report(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        repo = root / "repo"
+        (repo / "src").mkdir(parents=True)
+        (repo / "src" / "add.py").write_text("def add(a, b):\n    return 0\n", encoding="utf-8")
+        (repo / "test_slow.py").write_text(
+            "import time\nimport unittest\n\n"
+            "class Slow(unittest.TestCase):\n"
+            "    def test_slow(self):\n"
+            "        time.sleep(30)\n",
+            encoding="utf-8",
+        )
+        cfg = load_config()
+        cfg["maxAttempts"] = 1
+        cfg["attemptTimeoutSec"] = 1
+        cfg["overallTimeoutSec"] = 10
+        ollama = FakeOllama([InstalledModel("qwen2.5-coder:7b", 7.6)], "def add(a, b):\n    return 1\n")
+        service = Service(cfg, lambda: 4.0, ollama, log_path=root / "log.jsonl")
+        started = time.monotonic()
+        result = service.job(
+            {
+                "instruction": "Make add return the sum.",
+                "files": ["src/add.py", "test_slow.py"],
+                "targets": ["src/add.py"],
+                "repo": str(repo),
+                "testCommand": ["python3", "-m", "unittest", "test_slow"],
+            }
+        )
+        self.assertLess(time.monotonic() - started, 8)
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["timedOut"])
+        self.assertEqual(result["attempts"], 1)
+        self.assertIn("timed out", result["report"])
+        self.assertIn("return 0", (repo / "src" / "add.py").read_text(encoding="utf-8"))
+        record = json.loads((root / "log.jsonl").read_text(encoding="utf-8").splitlines()[0])
+        self.assertTrue(record["timedOut"])
+        self.assertFalse(record["ok"])
+
+    def test_rejects_shell_network_and_secret_files(self) -> None:
+        cfg = load_config()
+        prefixes = cfg["allowedTestPrefixes"]
+        self.assertTrue(command_allowed(["python3", "-m", "pytest", "tests"], prefixes))
+        self.assertTrue(command_allowed(["/usr/bin/python3", "-m", "unittest", "t"], prefixes))
+        self.assertTrue(command_allowed(["npm", "test"], prefixes))
+        self.assertTrue(command_allowed(["go", "test", "./..."], prefixes))
+        self.assertFalse(command_allowed(["bash", "-c", "curl http://evil"], prefixes))
+        self.assertFalse(command_allowed("python3 -m pytest", prefixes))
+        self.assertFalse(command_allowed(["python3", "-m", "pytest", "http://evil"], prefixes))
+        ollama = FakeOllama([InstalledModel("qwen2.5-coder:7b", 7.0)])
+        service = Service(cfg, lambda: 4.0, ollama)
+        with self.assertRaises(JobError):
+            service.job(
+                {
+                    "instruction": "write add",
+                    "repo": "/tmp",
+                    "targets": ["a.py"],
+                    "testCommand": ["bash", "-c", "echo hi"],
+                }
+            )
+        self.assertEqual(ollama.generated, [])
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        repo = Path(tmp.name) / "repo"
+        repo.mkdir()
+        (repo / ".env").write_text("TOKEN=1\n", encoding="utf-8")
+        with self.assertRaises(JobError) as caught:
+            service.job({"instruction": "Summarize this.", "files": [".env"], "repo": str(repo)})
+        self.assertIn("secret", str(caught.exception))
+        self.assertEqual(ollama.generated, [])
+
+    def test_summary_reads_a_large_file_locally(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        repo = Path(tmp.name) / "repo"
+        (repo / "logs").mkdir(parents=True)
+        blob = "ERROR line\n" * 3000
+        self.assertGreater(len(blob), 12000)
+        (repo / "logs" / "app.log").write_text(blob, encoding="utf-8")
+        ollama = FakeOllama([InstalledModel("qwen2.5-coder:7b", 7.0)], "short summary")
+        service = Service(load_config(), lambda: 4.0, ollama)
+        text = service.job(
+            {
+                "instruction": "Summarize this log.",
+                "files": ["logs/app.log"],
+                "repo": str(repo),
+            }
+        )
+        self.assertEqual(text, "short summary")
+        self.assertIn("ERROR line", ollama.generated[0]["prompt"])
+        self.assertTrue(ollama.generated[0]["summary"])
+        self.assertEqual((repo / "logs" / "app.log").read_text(encoding="utf-8"), blob)
+
+
+class Python39Tests(unittest.TestCase):
+    def test_sources_avoid_newer_syntax(self) -> None:
+        banned = tuple(
+            getattr(ast, name)
+            for name in ("Match", "TryStar", "TypeAlias")
+            if hasattr(ast, name)
+        )
+        for name in ("server.py", "install.py", "test_server.py"):
+            path = CONFIG_PATH.parent / name
+            text = path.read_text(encoding="utf-8")
+            self.assertIn("from __future__ import annotations\n", text)
+            tree = ast.parse(text)
+            for node in ast.walk(tree):
+                self.assertNotIsInstance(node, banned)
+        for name in ("server.py", "install.py"):
+            text = (CONFIG_PATH.parent / name).read_text(encoding="utf-8")
+            self.assertNotIn("import tomllib", text)
+            self.assertNotIn("except*", text)
 
 
 if __name__ == "__main__":

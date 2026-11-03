@@ -6,15 +6,24 @@ The default --repo is https://github.com/Diebeste/GrokProjects, which
 keeps this skill in its local-offload subfolder.
 The files land in ~/.local-offload. Both skills are copied into the
 Cursor and Codex skill directories. This script does not know a store path.
+
+--setup, --pull, and --never run only when you pass them. The server never
+calls them. --setup is for after the user says yes.
 """
 
 from __future__ import annotations
 
 import argparse
+import platform
 import shutil
 import subprocess
 import sys
+import time
+import urllib.error
+import urllib.request
 from pathlib import Path
+
+import server
 
 DEFAULT_REPO = "https://github.com/Diebeste/GrokProjects"
 SKILL_SUBDIR = "local-offload"
@@ -131,8 +140,185 @@ def next_commands(dest: Path, home: Path) -> str:
             "  -H 'Content-Type: application/json' \\",
             '  -d \'{"instruction":"Write a Python function add(a, b) that returns the sum.","test":"add(1, 2) is 3"}\'',
             "",
+            "python3 install.py --setup   # only after the user says yes",
+            "python3 install.py --pull",
+            "python3 install.py --never",
+            "",
         ]
     )
+
+
+LINUX_INSTALL = [
+    "bash",
+    "-c",
+    "curl -fsSL --retry 3 --max-time 180 https://ollama.com/install.sh | sh",
+]
+DARWIN_ZIP = (
+    "curl -fsSL -o /tmp/Ollama-darwin.zip https://ollama.com/download/Ollama-darwin.zip"
+    " && unzip -o /tmp/Ollama-darwin.zip -d /Applications"
+)
+WINDOWS_INSTALL = (
+    "Invoke-WebRequest -Uri https://ollama.com/download/OllamaSetup.exe -OutFile OllamaSetup.exe; "
+    "Start-Process .\\OllamaSetup.exe -ArgumentList '/VERYSILENT' -Wait"
+)
+
+
+class LiveSetup:
+    def system(self) -> str:
+        return platform.system()
+
+    def arch(self) -> str:
+        return platform.machine()
+
+    def which(self, name: str):
+        return shutil.which(name)
+
+    def run(self, argv: list[str]) -> None:
+        sys.stdout.write("setup: " + " ".join(argv) + "\n")
+        sys.stdout.flush()
+        completed = subprocess.run(argv, check=False)
+        if completed.returncode != 0:
+            raise SystemExit(f"command failed ({completed.returncode}): {argv[0]}")
+
+    def spawn(self, argv: list[str]) -> None:
+        sys.stdout.write("setup: start " + " ".join(argv) + "\n")
+        sys.stdout.flush()
+        subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=None,
+            start_new_session=True,
+        )
+
+    def memory_gb(self):
+        return server.read_memory_gb()
+
+    def healthy(self, url: str) -> bool:
+        request = urllib.request.Request(url, headers={"Accept": "application/json"}, method="GET")
+        try:
+            with urllib.request.urlopen(request, timeout=1.5) as response:
+                return int(getattr(response, "status", 200)) == 200
+        except (urllib.error.URLError, OSError):
+            return False
+
+    def sleep(self, seconds: float) -> None:
+        time.sleep(seconds)
+
+    def fetch_tier(self, url: str):
+        request = urllib.request.Request(url, headers={"Accept": "application/json"}, method="GET")
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                raw = response.read()
+                return int(getattr(response, "status", 200)), raw.decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            try:
+                raw = exc.read().decode("utf-8", "replace")
+            finally:
+                exc.close()
+            return exc.code, raw
+        except urllib.error.URLError:
+            return 0, ""
+
+
+def install_argv(system: str, which) -> list[str]:
+    if system == "Darwin":
+        if which("brew"):
+            return ["brew", "install", "ollama"]
+        return ["bash", "-c", DARWIN_ZIP]
+    if system == "Windows":
+        return ["powershell", "-NoProfile", "-Command", WINDOWS_INSTALL]
+    return list(LINUX_INSTALL)
+
+
+def recommended_model(config: dict, memory_gb, server_name: str) -> str:
+    rung = server.select_rung(memory_gb, config)
+    if server_name == "mlx":
+        return str(rung["mlxTag"])
+    return str(rung["tag"])
+
+
+def _wait_until(predicate, attempts: int, sleep) -> bool:
+    for _ in range(attempts):
+        if predicate():
+            return True
+        sleep(0.25)
+    return False
+
+
+def perform_setup(server_name: str, home: Path, host: LiveSetup | None = None) -> str:
+    if server_name not in ("ollama", "mlx"):
+        raise SystemExit("setup server must be ollama or mlx")
+    host = host or LiveSetup()
+    system = host.system()
+    if server_name == "mlx" and not (system == "Darwin" and host.arch() in ("arm64", "aarch64")):
+        raise SystemExit("MLX setup is only for Apple Silicon")
+    config = server.load_config()
+    model = recommended_model(config, host.memory_gb(), server_name)
+    sys.stdout.write(f"setup: installing {server_name} for {system}\n")
+    sys.stdout.flush()
+    if server_name == "mlx":
+        host.run([sys.executable, "-m", "pip", "install", "mlx-lm"])
+        sys.stdout.write(f"setup: pulling {model}\n")
+        sys.stdout.flush()
+        code = "from huggingface_hub import snapshot_download; snapshot_download(%r)" % model
+        host.run([sys.executable, "-c", code])
+        if not host.healthy("http://127.0.0.1:8080/v1/models"):
+            host.spawn([sys.executable, "-m", "mlx_lm.server", "--host", "127.0.0.1", "--port", "8080"])
+            _wait_until(lambda: host.healthy("http://127.0.0.1:8080/v1/models"), 20, host.sleep)
+    else:
+        host.run(install_argv(system, host.which))
+        if not host.healthy("http://127.0.0.1:11434/api/tags"):
+            host.spawn(["ollama", "serve"])
+            if not _wait_until(lambda: host.healthy("http://127.0.0.1:11434/api/tags"), 40, host.sleep):
+                raise SystemExit("ollama did not start")
+        sys.stdout.write(f"setup: pulling {model}\n")
+        sys.stdout.flush()
+        host.run(["ollama", "pull", model])
+    return _verify_tier(home, host)
+
+
+def perform_pull(home: Path, host: LiveSetup | None = None, discover=None) -> None:
+    host = host or LiveSetup()
+    config = server.load_config()
+    found = (discover or server.discover_backend)(config)
+    if found is None:
+        raise SystemExit("no local backend found; run python3 install.py --setup only after the user says yes")
+    model = recommended_model(config, host.memory_gb(), found.name)
+    sys.stdout.write(f"setup: pulling {model} on {found.name}\n")
+    sys.stdout.flush()
+    if found.name == "mlx":
+        code = "from huggingface_hub import snapshot_download; snapshot_download(%r)" % model
+        host.run([sys.executable, "-c", code])
+        return
+    if found.name != "ollama" and found.api != "ollama":
+        raise SystemExit(f"{found.name} is running; load {model} in that app")
+    host.run(["ollama", "pull", model])
+
+
+def _verify_tier(home: Path, host: LiveSetup) -> str:
+    port = int(server.load_config()["port"])
+    url = f"http://127.0.0.1:{port}/tier"
+    sys.stdout.write("setup: verifying /tier\n")
+    sys.stdout.flush()
+    status, body = host.fetch_tier(url)
+    if status == 0:
+        script = runtime_dir(home) / "server.py"
+        if not script.is_file():
+            script = Path(__file__).resolve().parent / "server.py"
+        host.spawn([sys.executable, str(script)])
+        for _ in range(20):
+            host.sleep(0.25)
+            status, body = host.fetch_tier(url)
+            if status != 0:
+                break
+    sys.stdout.write(f"setup: /tier {status}\n")
+    if body:
+        sys.stdout.write(body + "\n")
+    sys.stdout.flush()
+    if status != 200:
+        raise SystemExit(f"/tier returned {status}")
+    return body
 
 
 def _option_given(argv: list[str], flag: str) -> bool:
@@ -199,9 +385,34 @@ def main(argv: list[str] | None = None) -> None:
         ),
     )
     parser.add_argument("--path", help="path to a git checkout the host already has")
+    parser.add_argument(
+        "--setup",
+        nargs="?",
+        const="ollama",
+        default=None,
+        help="install ollama (default) or mlx, then pull the recommended model. Only after the user says yes.",
+    )
+    parser.add_argument("--pull", action="store_true", help="pull the recommended model; do not install a server")
+    parser.add_argument("--never", action="store_true", help="save the never-ask flag in ~/.local-offload/config")
     args = parser.parse_args(argv)
     supplied = list(sys.argv[1:] if argv is None else argv)
     home = default_home()
+    maintenance = [name for name, enabled in (("setup", args.setup is not None), ("pull", args.pull), ("never", args.never)) if enabled]
+    if maintenance:
+        if args.path or _option_given(supplied, "--repo"):
+            raise SystemExit("pass either an install source or a setup command")
+        if len(maintenance) > 1:
+            raise SystemExit("pass only one of --never, --pull, or --setup")
+        if args.never:
+            path = server.user_config_path(home)
+            server.write_never_ask(path)
+            sys.stdout.write(f"saved never-ask flag to {path}\n")
+            return
+        if args.pull:
+            perform_pull(home)
+            return
+        perform_setup(str(args.setup), home)
+        return
     dest = install(
         args.repo,
         args.path,

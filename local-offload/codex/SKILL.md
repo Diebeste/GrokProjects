@@ -1,25 +1,50 @@
 ---
 name: local-offload
-description: "Draft one bounded code slice on the local Ollama service at 127.0.0.1:8765. Use when Codex already knows the slice (one short function, one file, or one multi-file change), will apply the text, and will run a test Codex defined. If GET /tier fails, Codex does the work."
+description: "Offload boilerplate, scaffolding, mechanical edits, and summaries to the local service at 127.0.0.1:8765. Use when Codex already knows the slice, will apply the text, and will rerun the test once. If no local backend is running, ask before any install. Keep open-ended design, debugging, and security-sensitive work."
 ---
 
 # Local offload
 
-You are Codex. You size one slice, send it to the local service, apply the text that comes back, and run the test you defined. You keep the repository, credentials, and files. You keep open-ended design.
+You are Codex. You send one bounded slice to the local model, apply what comes back, and rerun the test you defined. You keep the repository, credentials, and files. Call the service with `curl` against loopback. There is no API key.
 
-The service returns generated text only. It has no tools and no filesystem. Call it with `curl` against loopback. There is no API key.
+## What you offload
 
-## If /tier fails
+Send work small models do well:
+
+- boilerplate and repetitive glue
+- test scaffolding
+- docstrings and comments
+- mechanical renames and refactors
+- format conversions
+- summaries of large files or logs
+
+For a summary, pass the file path in `files`. The local model reads the big text. You read only the summary. Do not paste the file into your own context.
+
+## What you keep
+
+Keep open-ended design, debugging, and anything security-sensitive. Do not send secrets, tokens, or `.env` files.
+
+## If /tier is not 200
 
 `GET http://127.0.0.1:8765/tier`
 
 ```bash
-curl -sS --max-time 300 http://127.0.0.1:8765/tier
+curl -sS --max-time 30 http://127.0.0.1:8765/tier
 ```
 
-Allow several minutes on the first call. That call can install Ollama and download a model.
+If the status is 503 and `setup.neverAsk` is true, do the work yourself and do not ask.
 
-If the connection is refused, the command times out, or the HTTP status is not 200, install once when `~/.local-offload/server.py` is missing. Do not install a second time when that file is already there.
+If `setup.ask` is set, ask the user that exact string. It looks like:
+
+`No local model found. Install <server> + <model> (~X GB)? [yes / not now / never]`
+
+On Apple Silicon, mention MLX only when it is listed in `setup.alternatives`. Still ask `setup.ask`.
+
+- yes: `python3 install.py --setup` from `~/.local-offload`. Use `python3 install.py --setup mlx` only when the user chose MLX. The command prints progress and then checks `/tier`. Never install without the user's yes.
+- not now: do this task yourself. Ask again next session. Do not write a flag.
+- never: `python3 install.py --never`, which saves `~/.local-offload/config`, then do the work yourself.
+
+If the connection is refused, install once when `~/.local-offload/server.py` is missing. Do not install a second time when that file is already there.
 
 From a git checkout the host already has:
 
@@ -40,11 +65,11 @@ cd ~/.local-offload
 python3 server.py
 ```
 
-If `~/.local-offload/server.py` was already installed, skip the installer and only start it, then request `/tier` again. If that request is still not 200, do the work yourself.
+If that file was already installed, skip the installer and only start it. If `/tier` is still not 200 after the user says not now or never, do the work yourself.
 
 ## Size the job
 
-Read `slice`, `model`, `parameterClass`, and `instruction` from the JSON body.
+Read `slice`, `model`, `parameterClass`, `instruction`, and `needsPull`.
 
 | `slice` | What you send |
 | --- | --- |
@@ -52,26 +77,34 @@ Read `slice`, `model`, `parameterClass`, and `instruction` from the JSON body.
 | `file` | One file |
 | `multifile` | One multi-file change |
 
-If the task is larger than that slice, keep the rest and send one fitting slice, or do the whole task yourself. Follow the `instruction` line from `/tier`.
+If `needsPull` is true, ask before `python3 install.py --pull`. Do not pull by yourself.
 
-Define the test you will run before you POST. You run that test. The service does not run it.
+If the task is larger than that slice, keep the rest or do the whole task yourself.
 
 ## POST /job
+
+Summary, without a test command:
 
 ```bash
 curl -sS --max-time 300 http://127.0.0.1:8765/job \
   -H 'Content-Type: application/json' \
-  -d '{"instruction":"Write a Python function add(a, b) that returns the sum of its arguments.","test":"add(1, 2) is 3 and add(-1, 1) is 0","context":"optional small excerpt you paste"}'
+  -d '{"instruction":"Summarize this log in one short paragraph.","files":["logs/app.log"],"repo":"/absolute/path/to/repo"}'
 ```
 
-`instruction` is required. `test` is the test description you already defined. `context` is a small excerpt you paste. Leave secrets out.
+A 200 `text/plain` body is the summary or the draft. Read a summary as-is.
 
-A 200 response is `text/plain`: the generated slice and nothing else. If a single markdown fence wraps it, apply the fenced body. Apply it in the repo yourself, then run your test.
+Local test loop:
 
-Any other status means you do the work yourself.
+```bash
+curl -sS --max-time 600 http://127.0.0.1:8765/job \
+  -H 'Content-Type: application/json' \
+  -d '{"instruction":"Make add return the sum.","files":["src/add.py","tests/test_add.py"],"targets":["src/add.py"],"repo":"/absolute/path/to/repo","testCommand":["python3","-m","pytest","tests/test_add.py"]}'
+```
 
-## One retry
+`testCommand` is an argv array: `pytest`, `unittest`, `npm test`, or `go test`. No shell string, no network URL, no secrets.
 
-If your test fails, POST `/job` once more. Keep the same slice. Put a short failure excerpt in `context`. If the second result fails the test, finish the work yourself. Do not send a third job.
+The service copies the files into a scratch dir, runs the test, and retries up to 5 times inside an overall time limit. It never writes the real repo. Log lines go to `~/.local-offload/log.jsonl`.
 
-You get one retry.
+If the JSON `ok` field is true, write `files` into the repo and rerun that test command once. If `ok` is false, do the work yourself.
+
+You get one local loop per task.

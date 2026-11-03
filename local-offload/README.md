@@ -1,6 +1,8 @@
 # Local offload
 
-Loopback service that drafts one code slice with Ollama. The Cursor host assigns the slice, applies the text, and runs the test it defined. The service does not read a repository, apply a patch, or run a test.
+Loopback service that spends the user's local hardware on bounded work: boilerplate, test scaffolding, docstrings, mechanical edits, format conversions, and summaries of large files or logs. The Cursor or Codex host keeps open-ended design, debugging, and anything security-sensitive. It applies the result and reruns the test once.
+
+The service talks to any local OpenAI-compatible server. It probes `GET /v1/models`, then calls `POST /v1/chat/completions`. Ollama's native `/api/tags` and `/api/chat` are used only when `/v1/models` is missing.
 
 ## Install
 
@@ -20,6 +22,15 @@ python3 install.py --path /path/to/local-offload
 
 It writes the service, config, tests, README, installer, and both skills to `~/.local-offload` (`/Users/macbookdesarai/.local-offload` on this Mac). It also copies the skills to `~/.cursor/skills/local-offload/SKILL.md` and `~/.codex/skills/local-offload/SKILL.md`. The installer prints the next commands.
 
+The service never installs a backend and never pulls a model. Those commands run only when you pass them, and only after the user says yes:
+
+```bash
+python3 install.py --setup
+python3 install.py --setup mlx
+python3 install.py --pull
+python3 install.py --never
+```
+
 ## Run
 
 From `~/.local-offload`, not from `~`:
@@ -29,11 +40,19 @@ cd ~/.local-offload
 python3 server.py
 ```
 
-The process listens on `http://127.0.0.1:8765`. There is no API key. It binds to `127.0.0.1` only.
+The process listens on `http://127.0.0.1:8765`. There is no API key. It binds to `127.0.0.1` only. Python 3.9 is enough (`from __future__ import annotations` is set; the code does not use 3.10-only syntax).
 
-If `ollama` is missing from `PATH`, the first `GET /tier` runs the official installer at `https://ollama.com/install.sh` and then starts `ollama serve` on `127.0.0.1:11434`. The installer needs root, outbound network, and `zstd` (the Linux archive is zstd-compressed). If install or startup fails, `GET /tier` returns 503 and the host does the work.
+On startup it probes, in order:
 
-The first `GET /tier` also pulls the pinned model for this machine when no installed model fits the rung. That download can take several minutes.
+| Name | Base URL |
+| --- | --- |
+| `baseUrl` in `config.json`, when set | user URL |
+| Ollama | `http://127.0.0.1:11434` |
+| LM Studio | `http://127.0.0.1:1234` |
+| llama.cpp server | `http://127.0.0.1:8080` |
+| MLX (`mlx_lm.server`) | `http://127.0.0.1:8080` |
+
+A URL is probed once. llama.cpp and MLX share port 8080, so the first configured name wins. Put the server you actually run earlier in `backends`, or set `baseUrl`.
 
 ```bash
 curl -sS http://127.0.0.1:8765/tier
@@ -42,19 +61,41 @@ curl -sS http://127.0.0.1:8765/job \
   -d '{"instruction":"Write a Python function add(a, b) that returns the sum.","test":"add(1, 2) is 3"}'
 ```
 
-`GET /tier` returns JSON: `model`, `parameterClass`, `slice` (`function`, `file`, or `multifile`), and a one-line `instruction`. `POST /job` returns the generated text only.
+`GET /tier` returns JSON: `model`, `parameterClass`, `slice` (`function`, `file`, or `multifile`), `instruction`, `backend`, `api`, and `needsPull`. `POST /job` without `testCommand` returns the generated text only.
+
+## When no backend is running
+
+`GET /tier` returns 503. It does not run an installer. The body has a one-line `hint` and a `setup` object: detected OS, arch, and memory; the recommended server (Ollama); the model tag and download size for this hardware; the exact commands; and `ask`. On Apple Silicon, `setup.alternatives` includes MLX.
+
+The host asks the user the `setup.ask` string:
+
+`No local model found. Install <server> + <model> (~X GB)? [yes / not now / never]`
+
+- yes: `python3 install.py --setup`. macOS uses `brew install ollama` when Homebrew is present, otherwise the official Ollama.app zip. Windows runs the official `OllamaSetup.exe` installer. Linux runs `https://ollama.com/install.sh`. The command prints progress, pulls the recommended model, and verifies `GET /tier`. `python3 install.py --setup mlx` is the Apple Silicon alternative.
+- not now: the host does this task itself and asks again next session. Nothing is saved.
+- never: `python3 install.py --never` writes `{"neverAsk": true}` to `~/.local-offload/config`. Later 503 responses set `setup.ask` to null and `setup.neverAsk` to true, and the host stops asking.
+
+Never install without the user's yes. `python3 install.py --pull` only downloads the recommended model, and only when a backend is already up.
 
 ## Memory ladder
 
 The service reads discrete GPU VRAM when it can: `nvidia-smi` total memory, or Linux AMD `mem_info_vram_total`. Otherwise it reads system RAM (`/proc/meminfo`, `sysctl hw.memsize`, or Windows CIM `TotalPhysicalMemory`). Figures are 1024-based GB, so 8192 MiB is 8 GB. A failed read uses the 7B tag and stops.
 
-| Memory | Class | Slice | Pinned tag |
-| --- | --- | --- | --- |
-| under 8 GB | 7B | function | `qwen2.5-coder:7b` |
-| 8–16 GB | 14B | file | `qwen2.5-coder:14b` |
-| above 16 GB | 32B | multifile | `qwen2.5-coder:32b` |
+| Memory | Class | Slice | Pinned tag | Download |
+| --- | --- | --- | --- | --- |
+| under 8 GB | 7B | function | `qwen2.5-coder:7b` | 4.7 GB |
+| 8–16 GB | 14B | file | `qwen2.5-coder:14b` | 9 GB |
+| above 16 GB | 32B | multifile | `qwen2.5-coder:32b` | 19 GB |
 
-Tags are pinned in `config.json`. If an installed model has a parameter count in that rung's band, the service uses it. If several fit, the pinned tag wins when it is installed; otherwise the closest parameter count is used. If none fit, the service pulls the pinned tag.
+Tags and sizes are pinned in `config.json`. If an installed model has a parameter count in that rung's band, the service uses it. If several fit, the pinned tag wins when it is installed; otherwise the closest parameter count is used. If none fit, `/tier` sets `needsPull` and does not download anything. A backend that lists models with no parameter size in the id is used as-is.
+
+## Local test loop
+
+Send `repo`, `files`, `targets`, and `testCommand` to run the loop. The service copies the listed files (or the repo when `files` is omitted) into a temp scratch directory, writes the model's code there, and runs the command with a timeout. Failure output goes back to the model. It retries up to `maxAttempts` (default 5) and stops at `overallTimeoutSec`. The response is JSON: passing `files` plus `testOutput`, or a failure `report`. The real repo is never written. The host applies `files` only when `ok` is true and reruns the test once.
+
+`testCommand` is an argv array and must start with an allow-listed prefix: `python3 -m pytest`, `python3 -m unittest`, `python -m pytest`, `python -m unittest`, `npm test`, or `go test`. The process gets a scrubbed environment (no secrets copied in) and the arguments cannot contain shell operators or URLs.
+
+Each attempt is appended to `~/.local-offload/log.jsonl` with the attempt number and `tokensSaved` (about 4 characters per token of the local prompt and reply). The log does not store the prompt or the file text.
 
 ## Skills
 
@@ -75,4 +116,4 @@ Invoke it as `$local-offload`, or let Codex select it when a bounded slice shoul
 python3 -m unittest test_server.py
 ```
 
-The unit tests cover the ladder and the HTTP handlers without a live model.
+The unit tests cover the ladder, backend probing, the no-backend 503 and its setup payload, the never-ask flag, the scratch retry loop, and the HTTP handlers. They do not need a live model.
