@@ -14,6 +14,7 @@ calls them. --setup is for after the user says yes.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import platform
 import shutil
@@ -213,6 +214,30 @@ class LiveSetup:
     def memory_gb(self):
         return server.read_memory_gb()
 
+    def installed_models(self) -> list:
+        names = []
+        for url in (
+            "http://127.0.0.1:11434/api/tags",
+            "http://127.0.0.1:11434/v1/models",
+        ):
+            request = urllib.request.Request(url, headers={"Accept": "application/json"}, method="GET")
+            try:
+                with urllib.request.urlopen(request, timeout=2) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+            except (urllib.error.URLError, OSError, json.JSONDecodeError, UnicodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            for item in payload.get("models") or []:
+                if isinstance(item, dict) and isinstance(item.get("name"), str):
+                    names.append(item["name"])
+            for item in payload.get("data") or []:
+                if isinstance(item, dict) and isinstance(item.get("id"), str):
+                    names.append(item["id"])
+            if names:
+                return names
+        return names
+
     def healthy(self, url: str) -> bool:
         request = urllib.request.Request(url, headers={"Accept": "application/json"}, method="GET")
         try:
@@ -330,6 +355,31 @@ def start_ollama(host, binary: str) -> None:
         )
 
 
+def _server_binary(host):
+    try:
+        return find_ollama(host.which, host.is_file, host.home_dir(), host.localappdata())
+    except SystemExit:
+        return None
+
+
+def _model_installed(host, tag: str) -> bool:
+    names = host.installed_models() if hasattr(host, "installed_models") else []
+    for name in names:
+        if not isinstance(name, str):
+            continue
+        if name == tag or name.split("@", 1)[0] == tag:
+            return True
+    return False
+
+
+def perform_set_model(home: Path, model: str, quality: str | None = None) -> None:
+    config = server.load_config()
+    if server.rung_by_tag(config, model) is None:
+        raise SystemExit(f"unknown model {model}")
+    server.save_model_choice(server.user_config_path(home, config), model, quality)
+    sys.stdout.write(f"saved model choice {model}\n")
+
+
 def perform_setup(
     server_name: str,
     home: Path,
@@ -344,9 +394,21 @@ def perform_setup(
     if server_name == "mlx" and not (system == "Darwin" and host.arch() in ("arm64", "aarch64")):
         raise SystemExit("MLX setup is only for Apple Silicon")
     config = server.load_config()
+    model_tag = recommended_model(config, host.memory_gb(), server_name, model, quality)
     if model or quality:
         server.save_model_choice(server.user_config_path(home, config), model, quality)
-    model_tag = recommended_model(config, host.memory_gb(), server_name, model, quality)
+        binary = _server_binary(host)
+        if binary and server_name != "mlx":
+            if not host.healthy(OLLAMA_HEALTH_URL):
+                start_ollama(host, binary)
+            if _model_installed(host, model_tag):
+                sys.stdout.write(f"setup: {model_tag} is already installed; saved the choice\n")
+                sys.stdout.flush()
+                return model_tag
+            sys.stdout.write(f"setup: server already installed; pulling {model_tag}\n")
+            sys.stdout.flush()
+            host.run([binary, "pull", model_tag])
+            return _verify_tier(home, host)
     sys.stdout.write(f"setup: installing {server_name} for {system}\n")
     sys.stdout.flush()
     if server_name == "mlx":
@@ -493,12 +555,18 @@ def main(argv: list[str] | None = None) -> None:
         help="install ollama (default) or mlx, then pull the recommended model. Only after the user says yes.",
     )
     parser.add_argument("--pull", action="store_true", help="pull the recommended model; do not install a server")
-    parser.add_argument("--model", help="model tag to pull and save as preferredModel")
+    parser.add_argument("--model", help="model tag to pull during --setup or --pull, and save as preferredModel")
+    parser.add_argument("--set-model", help="save preferredModel only; do not install or pull")
     parser.add_argument("--quality", choices=("fast", "balanced", "best"), help="fast, balanced, or best")
-    parser.add_argument("--never", action="store_true", help="save the never-ask flag in ~/.local-offload/config")
+    parser.add_argument("--never", action="store_true", help="save the never-ask flag")
     args = parser.parse_args(argv)
     supplied = list(sys.argv[1:] if argv is None else argv)
     home = default_home()
+    if args.set_model:
+        if args.path or _option_given(supplied, "--repo") or args.setup is not None or args.pull or args.never or args.model:
+            raise SystemExit("pass --set-model by itself")
+        perform_set_model(home, args.set_model, args.quality)
+        return
     maintenance = [name for name, enabled in (("setup", args.setup is not None), ("pull", args.pull), ("never", args.never)) if enabled]
     if maintenance:
         if args.path or _option_given(supplied, "--repo"):

@@ -9,6 +9,7 @@ It does not write the real repository, install a backend, or pull a model.
 from __future__ import annotations
 
 import glob
+import hashlib
 import importlib.util
 import json
 import math
@@ -87,6 +88,7 @@ _LOG_KEYS = (
     "ok",
     "timedOut",
     "tokensSaved",
+    "tokensSpentLocal",
     "model",
     "backend",
     "durationMs",
@@ -103,9 +105,10 @@ class JobError(Exception):
 
 
 class ServiceError(Exception):
-    def __init__(self, message: str, status: int = 503) -> None:
+    def __init__(self, message: str, status: int = 503, timed_out: bool = False) -> None:
         super().__init__(message)
         self.status = status
+        self.timed_out = timed_out
         self.hint = None
         self.setup = None
         self.extra = None
@@ -248,7 +251,7 @@ def validate_config(config: dict) -> None:
     port = config.get("port")
     if not isinstance(port, int) or not (1 <= port <= 65535):
         raise SystemExit("invalid config: port")
-    for key in ("maxAttempts", "attemptTimeoutSec", "overallTimeoutSec", "localReadChars"):
+    for key in ("maxAttempts", "attemptTimeoutSec", "overallTimeoutSec", "generateTimeoutSec", "localReadChars"):
         value = config.get(key)
         if not isinstance(value, int) or value < 1:
             raise SystemExit(f"invalid config: {key}")
@@ -694,8 +697,13 @@ def real_fetch(method: str, url: str, payload: dict | None = None, timeout: floa
         finally:
             exc.close()
         return exc.code, {}
-    except urllib.error.URLError:
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", None)
+        if isinstance(reason, (TimeoutError, socket.timeout)):
+            raise ServiceError("generation timed out", status=504, timed_out=True) from exc
         return 0, {}
+    except (TimeoutError, socket.timeout) as exc:
+        raise ServiceError("generation timed out", status=504, timed_out=True) from exc
     if not raw:
         return status, {}
     try:
@@ -704,12 +712,14 @@ def real_fetch(method: str, url: str, payload: dict | None = None, timeout: floa
         return status, {}
 
 
-def openai_chat_payload(model: str, prompt: str, max_tokens: int, summary: bool = False) -> dict:
+def openai_chat_payload(
+    model: str, prompt: str, max_tokens: int, summary: bool = False, temperature: float = 0.1
+) -> dict:
     system = SUMMARY_PROMPT if summary else SYSTEM_PROMPT
     return {
         "model": model,
         "stream": False,
-        "temperature": 0.1,
+        "temperature": temperature,
         "max_tokens": max_tokens,
         "messages": [
             {"role": "system", "content": system},
@@ -718,7 +728,9 @@ def openai_chat_payload(model: str, prompt: str, max_tokens: int, summary: bool 
     }
 
 
-def ollama_chat_payload(model: str, prompt: str, max_tokens: int, summary: bool = False) -> dict:
+def ollama_chat_payload(
+    model: str, prompt: str, max_tokens: int, summary: bool = False, temperature: float = 0.1
+) -> dict:
     system = SUMMARY_PROMPT if summary else SYSTEM_PROMPT
     return {
         "model": model,
@@ -727,7 +739,7 @@ def ollama_chat_payload(model: str, prompt: str, max_tokens: int, summary: bool 
             {"role": "system", "content": system},
             {"role": "user", "content": prompt},
         ],
-        "options": {"temperature": 0.1, "num_predict": max_tokens},
+        "options": {"temperature": temperature, "num_predict": max_tokens},
     }
 
 
@@ -756,11 +768,13 @@ class Generation:
         duration_ms: int,
         load_ms: int | None = None,
         tokens_per_sec: float | None = None,
+        metrics_note: str | None = None,
     ) -> None:
         self.text = text
         self.duration_ms = duration_ms
         self.load_ms = load_ms
         self.tokens_per_sec = tokens_per_sec
+        self.metrics_note = metrics_note
 
     def __eq__(self, other: object) -> bool:
         if isinstance(other, str):
@@ -780,22 +794,35 @@ def _ns_to_ms(value) -> int | None:
     return None
 
 
-def metrics_from_body(data: dict, wall_ms: int, openai: bool) -> tuple[int, int | None, float | None]:
-    if not openai:
-        load_ms = _ns_to_ms(data.get("load_duration"))
-        duration = _ns_to_ms(data.get("total_duration"))
-        rate = None
-        count = data.get("eval_count")
-        elapsed = data.get("eval_duration")
-        if isinstance(count, (int, float)) and isinstance(elapsed, (int, float)) and elapsed > 0:
-            rate = round(float(count) / (float(elapsed) / 1e9), 2)
-        return duration if duration is not None else wall_ms, load_ms, rate
+def metrics_from_body(data: dict, wall_ms: int, openai: bool) -> tuple[int, int | None, float | None, str | None]:
+    load_ms = _ns_to_ms(data.get("load_duration"))
+    eval_ns = data.get("eval_duration")
+    prompt_ns = data.get("prompt_eval_duration")
+    count = data.get("eval_count")
+    generation_ms = None
+    if isinstance(eval_ns, (int, float)) and eval_ns > 0:
+        generation_ms = int(eval_ns / 1e6)
+        if isinstance(prompt_ns, (int, float)) and prompt_ns > 0:
+            generation_ms += int(prompt_ns / 1e6)
     rate = None
-    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
-    count = usage.get("completion_tokens")
-    if isinstance(count, (int, float)) and wall_ms > 0:
-        rate = round(float(count) / (wall_ms / 1000.0), 2)
-    return wall_ms, None, rate
+    if isinstance(count, (int, float)) and isinstance(eval_ns, (int, float)) and eval_ns > 0:
+        rate = round(float(count) / (float(eval_ns) / 1e9), 2)
+    if rate is None:
+        usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+        completion = usage.get("completion_tokens")
+        if (
+            isinstance(completion, (int, float))
+            and isinstance(eval_ns, (int, float))
+            and eval_ns > 0
+        ):
+            rate = round(float(completion) / (float(eval_ns) / 1e9), 2)
+    note = None if load_ms is not None else "load time not reported"
+    if generation_ms is None:
+        total = _ns_to_ms(data.get("total_duration"))
+        duration = total if total is not None else wall_ms
+    else:
+        duration = generation_ms
+    return duration, load_ms, rate, note
 
 
 class BackendClient:
@@ -833,25 +860,25 @@ class BackendClient:
             found.append(InstalledModel(name=name, billion=billion))
         return found
 
-    def generate(self, model: str, prompt: str, max_tokens: int, summary: bool = False) -> Generation:
+    def _native_ollama(self) -> bool:
+        return self.name == "ollama" or self.api == "ollama" or self.base_url.endswith(":11434")
+
+    def generate(
+        self,
+        model: str,
+        prompt: str,
+        max_tokens: int,
+        summary: bool = False,
+        temperature: float = 0.1,
+        timeout: float | None = None,
+    ) -> Generation:
         started = time.monotonic()
-        if self.api == "openai":
-            data = self._post(
-                "/v1/chat/completions",
-                openai_chat_payload(model, prompt, max_tokens, summary),
-                GENERATE_TIMEOUT,
-                "generation failed",
-                502,
-            )
-            choices = data.get("choices") if isinstance(data.get("choices"), list) else []
-            message = choices[0].get("message") if choices and isinstance(choices[0], dict) else {}
-            content = _message_text(message.get("content") if isinstance(message, dict) else "")
-            openai = True
-        else:
+        limit = GENERATE_TIMEOUT if timeout is None else timeout
+        if self._native_ollama():
             data = self._post(
                 "/api/chat",
-                ollama_chat_payload(model, prompt, max_tokens, summary),
-                GENERATE_TIMEOUT,
+                ollama_chat_payload(model, prompt, max_tokens, summary, temperature),
+                limit,
                 "generation failed",
                 502,
             )
@@ -860,11 +887,23 @@ class BackendClient:
             message = data.get("message") if isinstance(data.get("message"), dict) else {}
             content = message.get("content") if isinstance(message.get("content"), str) else ""
             openai = False
+        else:
+            data = self._post(
+                "/v1/chat/completions",
+                openai_chat_payload(model, prompt, max_tokens, summary, temperature),
+                limit,
+                "generation failed",
+                502,
+            )
+            choices = data.get("choices") if isinstance(data.get("choices"), list) else []
+            message = choices[0].get("message") if choices and isinstance(choices[0], dict) else {}
+            content = _message_text(message.get("content") if isinstance(message, dict) else "")
+            openai = True
         if not isinstance(content, str) or content == "":
             raise ServiceError("empty generation", status=502)
         wall_ms = max(0, int((time.monotonic() - started) * 1000))
-        duration_ms, load_ms, rate = metrics_from_body(data, wall_ms, openai)
-        return Generation(content, duration_ms, load_ms, rate)
+        duration_ms, load_ms, rate, note = metrics_from_body(data, wall_ms, openai)
+        return Generation(content, duration_ms, load_ms, rate, note)
 
     def _get(self, path: str, timeout: float) -> dict:
         return self._request("GET", path, None, timeout, "backend is not running", 503)
@@ -1049,6 +1088,40 @@ def adjust_test_command(argv: list[str], repo: Path, pytest_ok: bool) -> list[st
             if unittest_compatible(src.read_text(encoding="utf-8", errors="replace")):
                 return fallback_unittest_argv(files[0])
     raise JobError("pytest is not installed. Use python3 -m unittest, or install pytest.")
+
+
+_FAIL_LINE = re.compile(r"^(?:FAILED|FAIL|ERROR)(?::\s+|\s+)(\S+)", re.MULTILINE)
+_ASSERT_LINE = re.compile(r"^(?:E\s+)?(AssertionError:.*|assert .*)$", re.MULTILINE)
+
+
+def parse_test_failure(output: str) -> dict:
+    tests = []
+    for match in _FAIL_LINE.finditer(output or ""):
+        name = match.group(1).strip()
+        if name not in tests:
+            tests.append(name)
+    assertions = []
+    for match in _ASSERT_LINE.finditer(output or ""):
+        line = match.group(1).strip()
+        if line not in assertions:
+            assertions.append(line)
+    traceback = ""
+    marker = (output or "").rfind("Traceback (most recent call last)")
+    if marker >= 0:
+        traceback = output[marker : marker + 1200]
+    elif output:
+        traceback = "\n".join(output.splitlines()[-30:])[:1200]
+    return {"tests": tests[:20], "assertions": assertions[:12], "traceback": traceback}
+
+
+def _is_test_rel(rel: str) -> bool:
+    name = Path(rel).name
+    lowered = rel.replace("\\", "/")
+    return name.startswith("test_") or name.endswith("_test.py") or lowered.startswith("tests/") or "/tests/" in lowered
+
+
+def _output_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def check_target_count(slice_name: str, targets: list[str]) -> None:
@@ -1382,15 +1455,17 @@ class Service:
             return raw
         return Generation(str(raw), wall)
 
-    def _meta(self, tier: dict, attempts: int, saved: int, generation: Generation) -> dict:
+    def _meta(self, tier: dict, attempts: int, saved: int, spent: int, generation: Generation) -> dict:
         return {
             "model": tier["model"],
             "backend": tier["backend"],
             "durationMs": generation.duration_ms,
             "loadMs": generation.load_ms,
             "tokensPerSec": generation.tokens_per_sec,
+            "metricsNote": generation.metrics_note,
             "attempts": attempts,
             "tokensSaved": saved,
+            "tokensSpentLocal": spent,
         }
 
     def job(self, body: dict):
@@ -1406,11 +1481,18 @@ class Service:
         prompt = build_prompt(tier["slice"], instruction, test, context, local)
         summary = bool(body.get("files")) and not test
         started = time.monotonic()
-        raw = self.backend.generate(tier["model"], prompt, rung["maxTokens"], summary=summary)
+        raw = self.backend.generate(
+            tier["model"],
+            prompt,
+            rung["maxTokens"],
+            summary=summary,
+            temperature=0.1,
+            timeout=float(self.config.get("generateTimeoutSec", 180)),
+        )
         generation = self._coerce_generation(raw, started)
         saved = estimate_tokens(prompt + generation.text)
-        meta = self._meta(tier, 1, saved, generation)
-        self._log(self._attempt_record(1, True, False, saved, tier, generation))
+        meta = self._meta(tier, 1, saved, 0, generation)
+        self._log(self._attempt_record(1, True, False, saved, 0, tier, generation))
         return TextResult(generation.text, meta)
 
     def test_loop(self, body: dict, instruction: str, test: str, context: str) -> dict:
@@ -1444,17 +1526,24 @@ class Service:
     def _run_loop(self, repo, files, targets, argv, instruction, test, context) -> dict:
         max_attempts = int(self.config["maxAttempts"])
         attempt_timeout = float(self.config["attemptTimeoutSec"])
+        generate_timeout = float(self.config.get("generateTimeoutSec", 180))
         overall = float(self.config["overallTimeoutSec"])
         started = self.clock()
         scratch = Path(tempfile.mkdtemp(prefix="local-offload-"))
         failure = ""
+        failing_tests: list[str] = []
         last_files: dict[str, str] = {}
         last_output = ""
         timed_out = False
         attempts = 0
         saved_total = 0
+        spent_total = 0
         duration_total = 0
-        last_generation = Generation("", 0)
+        last_generation = Generation("", 0, metrics_note="load time not reported")
+        stop_reason = "max_attempts"
+        temperature = 0.1
+        bumped = False
+        last_hash = None
         tier = self._require_model()
         rung = rung_by_class(self.config, tier["parameterClass"])
         try:
@@ -1472,65 +1561,134 @@ class Service:
             for attempt in range(1, max_attempts + 1):
                 now = self.clock()
                 if now - started >= overall:
+                    stop_reason = "budget_exhausted"
+                    timed_out = True
                     break
                 attempts = attempt
                 remaining = overall - (now - started)
-                timeout = min(attempt_timeout, remaining)
                 prompt = self._loop_prompt(
-                    tier["slice"], instruction, test, context, targets, scratch, failure
+                    tier["slice"], instruction, test, context, targets, scratch, failure, repo
                 )
-                started_gen = self.clock()
-                raw = self.backend.generate(tier["model"], prompt, rung["maxTokens"])
-                generation = self._coerce_generation(raw, started_gen)
+                gen_timeout = min(generate_timeout, remaining)
+                try:
+                    raw = self.backend.generate(
+                        tier["model"],
+                        prompt,
+                        rung["maxTokens"],
+                        temperature=temperature,
+                        timeout=gen_timeout,
+                    )
+                except ServiceError as exc:
+                    if exc.timed_out:
+                        stop_reason = "generate_timeout"
+                        timed_out = True
+                        break
+                    raise
+                generation = self._coerce_generation(raw, self.clock())
                 text = generation.text
                 last_generation = generation
                 duration_total += generation.duration_ms
-                saved = estimate_tokens(prompt + text)
-                saved_total += saved
+                spent = estimate_tokens(prompt + text)
+                if self.clock() - started >= overall:
+                    spent_total += spent
+                    stop_reason = "budget_exhausted"
+                    timed_out = True
+                    self._log(self._attempt_record(attempt, False, True, 0, spent, tier, generation))
+                    break
+                digest = _output_hash(text)
+                identical = last_hash is not None and digest == last_hash
+                last_hash = digest
+                if identical and bumped:
+                    spent_total += spent
+                    stop_reason = "identical_output"
+                    self._log(self._attempt_record(attempt, False, False, 0, spent, tier, generation))
+                    break
+                if identical:
+                    temperature = 0.7
+                    bumped = True
                 try:
                     written = parse_model_files(text, targets)
                 except JobError:
                     written = None
                 if written is None:
                     last_output = "model output did not include the target files"
-                    timed_out = False
                     failure = last_output
-                    self._log(self._attempt_record(attempt, False, False, saved, tier, generation))
+                    spent_total += spent
+                    self._log(self._attempt_record(attempt, False, False, 0, spent, tier, generation))
                     continue
                 for rel, content in written.items():
                     dest = scratch / safe_relative(rel)
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     dest.write_text(content, encoding="utf-8")
                 last_files = written
-                if timeout <= 0:
+                now = self.clock()
+                remaining = overall - (now - started)
+                if remaining <= 0:
+                    spent_total += spent
+                    stop_reason = "budget_exhausted"
                     timed_out = True
-                    last_output = "overall time limit reached"
-                    self._log(self._attempt_record(attempt, False, True, saved, tier, generation))
+                    self._log(self._attempt_record(attempt, False, True, 0, spent, tier, generation))
                     break
+                timeout = min(attempt_timeout, remaining)
                 result = self.runner(list(argv), scratch, timeout, scrub_env())
                 last_output = ((result.stdout or "") + (result.stderr or ""))[-8000:]
-                timed_out = bool(result.timed_out)
-                ok = result.code == 0 and not result.timed_out
-                self._log(self._attempt_record(attempt, ok, timed_out, saved, tier, generation))
+                parsed = parse_test_failure(last_output)
+                failing_tests = parsed["tests"]
+                attempt_timed_out = bool(result.timed_out)
+                ok = result.code == 0 and not attempt_timed_out
                 if ok:
-                    return self._loop_result(
-                        True, attempt, last_files, last_output, None, False, saved_total, duration_total, tier, generation
+                    saved_total += spent
+                    self._log(self._attempt_record(attempt, True, False, spent, 0, tier, generation))
+                    return self._finish(
+                        True,
+                        attempt,
+                        last_files,
+                        last_output,
+                        None,
+                        False,
+                        None,
+                        [],
+                        saved_total,
+                        spent_total,
+                        duration_total,
+                        tier,
+                        generation,
                     )
-                if result.timed_out:
-                    failure = f"test timed out after {timeout:g} seconds\n{last_output}"
+                spent_total += spent
+                self._log(self._attempt_record(attempt, False, attempt_timed_out, 0, spent, tier, generation))
+                if attempt_timed_out:
+                    timed_out = True
+                    failure = self._feedback_text(parsed, last_output, "test timed out")
                 else:
-                    failure = last_output or "test failed"
+                    failure = self._feedback_text(parsed, last_output, "test failed")
+                if self.clock() - started >= overall:
+                    stop_reason = "budget_exhausted"
+                    timed_out = True
+                    break
+            else:
+                stop_reason = "max_attempts"
+            if stop_reason == "max_attempts" and timed_out and self.clock() - started >= overall:
+                stop_reason = "budget_exhausted"
             report = f"failed after {attempts} attempts"
-            if timed_out:
+            if stop_reason == "budget_exhausted":
+                report += "; overall time budget exceeded"
+            elif stop_reason == "generate_timeout":
+                report += "; generation timed out"
+            elif stop_reason == "identical_output":
+                report += "; the model repeated the same output"
+            elif timed_out:
                 report += "; last attempt timed out"
-            return self._loop_result(
+            return self._finish(
                 False,
                 attempts,
                 last_files,
                 last_output,
                 report,
                 timed_out,
+                stop_reason,
+                failing_tests,
                 saved_total,
+                spent_total,
                 duration_total,
                 tier,
                 last_generation,
@@ -1538,10 +1696,39 @@ class Service:
         finally:
             shutil.rmtree(scratch, ignore_errors=True)
 
-    def _loop_result(
-        self, ok, attempts, files, test_output, report, timed_out, saved, duration_ms, tier, generation
+    def _feedback_text(self, parsed: dict, raw: str, headline: str) -> str:
+        lines = [headline + ". Fix only the failing parts. Do not rewrite code that already passes."]
+        if parsed["tests"]:
+            lines.append("Failing tests:")
+            lines.extend("- " + name for name in parsed["tests"])
+        if parsed["assertions"]:
+            lines.append("Assertion messages:")
+            lines.extend("- " + line for line in parsed["assertions"])
+        if parsed["traceback"]:
+            lines.append("Trimmed traceback:")
+            lines.append(parsed["traceback"])
+        if raw:
+            lines.append("Raw test output:")
+            lines.append(raw[-2000:])
+        return "\n".join(lines)
+
+    def _finish(
+        self,
+        ok,
+        attempts,
+        files,
+        test_output,
+        report,
+        timed_out,
+        stop_reason,
+        failing_tests,
+        saved,
+        spent,
+        duration_ms,
+        tier,
+        generation,
     ) -> dict:
-        meta = self._meta(tier, attempts, saved, generation)
+        meta = self._meta(tier, attempts, saved, spent, generation)
         meta["durationMs"] = duration_ms
         return {
             "ok": ok,
@@ -1550,23 +1737,35 @@ class Service:
             "testOutput": test_output,
             "report": report,
             "timedOut": timed_out,
+            "stopReason": stop_reason,
+            "failingTests": failing_tests,
             "model": meta["model"],
             "backend": meta["backend"],
             "durationMs": meta["durationMs"],
             "loadMs": meta["loadMs"],
             "tokensPerSec": meta["tokensPerSec"],
+            "metricsNote": meta["metricsNote"],
             "tokensSaved": saved,
+            "tokensSpentLocal": spent,
         }
 
     def _attempt_record(
-        self, attempt: int, ok: bool, timed_out: bool, saved: int, tier: dict, generation: Generation | None = None
+        self,
+        attempt: int,
+        ok: bool,
+        timed_out: bool,
+        saved: int,
+        spent: int,
+        tier: dict,
+        generation: Generation | None = None,
     ) -> dict:
         record = {
             "kind": "attempt",
             "attempt": attempt,
             "ok": ok,
             "timedOut": timed_out,
-            "tokensSaved": saved,
+            "tokensSaved": saved if ok else 0,
+            "tokensSpentLocal": 0 if ok else spent,
             "model": tier["model"],
             "backend": tier["backend"],
             "durationMs": None,
@@ -1579,21 +1778,49 @@ class Service:
             record["tokensPerSec"] = generation.tokens_per_sec
         return record
 
-    def _loop_prompt(self, slice_limit, instruction, test, context, targets, scratch, failure) -> str:
+    def _loop_prompt(self, slice_limit, instruction, test, context, targets, scratch, failure, repo: Path) -> str:
         parts = [build_prompt(slice_limit, instruction, test, context)]
+        writing_tests = any(_is_test_rel(rel) for rel in targets)
+        if writing_tests:
+            parts.append(
+                "You are writing the test file. A wrong assertion is your own bug. "
+                "Match the real behavior of the module under test. Do not invent behavior the source does not have."
+            )
+            for rel, text in self._source_under_test(scratch, targets):
+                parts.append(f"Module under test {rel} (do not rewrite it; match this behavior):\n{text}")
         for rel in targets:
             path = scratch / safe_relative(rel)
             current = ""
             if path.is_file():
                 current = path.read_text(encoding="utf-8", errors="replace")
-            parts.append(f"Current {rel}:\n{current}")
+            label = "Previous attempt code" if failure else "Current"
+            parts.append(f"{label} for {rel}:\n{current}")
         if len(targets) == 1:
             parts.append(f"Output only the full new contents of {targets[0]}. No markdown fence.")
         else:
             parts.append("Output each target as <<<FILE path>>> then the contents then <<<END>>>.")
         if failure:
-            parts.append("Previous test output:\n" + failure[-4000:])
+            parts.append(failure[-4000:])
         return "\n".join(parts)
+
+    def _source_under_test(self, scratch: Path, targets: list[str]) -> list[tuple[str, str]]:
+        skipped = {str(safe_relative(rel)) for rel in targets}
+        found = []
+        total = 0
+        for path in sorted(scratch.rglob("*.py")):
+            if path.is_symlink() or not path.is_file():
+                continue
+            rel = str(path.relative_to(scratch))
+            if rel in skipped or _is_test_rel(rel):
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+            remaining = 12000 - total
+            if remaining <= 0:
+                break
+            clipped = text[:remaining]
+            total += len(clipped)
+            found.append((rel, clipped))
+        return found
 
 
 class LoopbackServer(ThreadingHTTPServer):

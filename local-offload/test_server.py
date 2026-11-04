@@ -119,9 +119,24 @@ class FakeOllama:
         self.pulled.append(name)
         raise AssertionError("pull is not automatic")
 
-    def generate(self, model: str, prompt: str, max_tokens: int, summary: bool = False) -> str:
+    def generate(
+        self,
+        model: str,
+        prompt: str,
+        max_tokens: int,
+        summary: bool = False,
+        temperature: float = 0.1,
+        timeout: float | None = None,
+    ) -> str:
         self.generated.append(
-            {"model": model, "prompt": prompt, "max_tokens": max_tokens, "summary": summary}
+            {
+                "model": model,
+                "prompt": prompt,
+                "max_tokens": max_tokens,
+                "summary": summary,
+                "temperature": temperature,
+                "timeout": timeout,
+            }
         )
         if self.error:
             raise self.error
@@ -1033,6 +1048,8 @@ class _FakeSetup:
         healthy_after_open: bool = False,
         localappdata: str | None = None,
         home: str = "/Users/tester",
+        models=None,
+        always_healthy: bool = False,
     ) -> None:
         self._system = system
         self._arch = arch
@@ -1042,6 +1059,8 @@ class _FakeSetup:
         self._healthy_after_open = healthy_after_open
         self._localappdata = localappdata
         self._home = Path(home)
+        self._models = list(models or [])
+        self._always_healthy = always_healthy
         self.commands = []
         self.spawned = []
         self.opened = False
@@ -1066,6 +1085,9 @@ class _FakeSetup:
     def localappdata(self) -> str | None:
         return self._localappdata
 
+    def installed_models(self) -> list:
+        return list(self._models)
+
     def run(self, argv: list) -> None:
         self.commands.append(list(argv))
 
@@ -1082,6 +1104,8 @@ class _FakeSetup:
         return 16.0
 
     def healthy(self, url: str) -> bool:
+        if self._always_healthy:
+            return True
         if self.opened and self._healthy_after_open:
             return True
         return bool(self.spawned)
@@ -1225,6 +1249,13 @@ class LoopTests(unittest.TestCase):
             "def add(a, b):\n    return a + b\n",
         )
         calls = {"n": 0}
+        original_generate = ollama.generate
+
+        def varying_generate(*args, **kwargs):
+            text = original_generate(*args, **kwargs)
+            return text + "# %s\n" % (calls["n"] + 1)
+
+        ollama.generate = varying_generate
 
         def runner(argv, cwd, timeout, env):
             calls["n"] += 1
@@ -1264,7 +1295,10 @@ class LoopTests(unittest.TestCase):
         lines = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
         self.assertEqual([line["attempt"] for line in lines], [1, 2, 3])
         self.assertEqual([line["ok"] for line in lines], [False, False, True])
-        self.assertIsInstance(lines[-1]["tokensSaved"], int)
+        self.assertEqual(lines[0]["tokensSaved"], 0)
+        self.assertGreater(lines[0]["tokensSpentLocal"], 0)
+        self.assertGreater(lines[-1]["tokensSaved"], 0)
+        self.assertEqual(lines[-1]["tokensSpentLocal"], 0)
         logged = log.read_text(encoding="utf-8")
         self.assertNotIn("return a + b", logged)
         self.assertNotIn("super-secret", logged)
@@ -1504,7 +1538,7 @@ class SliceRunnerAndMetricsTests(unittest.TestCase):
 
     def test_text_response_headers_include_metrics(self) -> None:
         class Timed(FakeOllama):
-            def generate(self, model, prompt, max_tokens, summary=False):
+            def generate(self, model, prompt, max_tokens, summary=False, temperature=0.1, timeout=None):
                 self.generated.append({"model": model, "prompt": prompt, "max_tokens": max_tokens})
                 return server.Generation("def add(a, b):\n    return a + b\n", 2700, 9000, 6.4)
 
@@ -1609,14 +1643,216 @@ class SliceRunnerAndMetricsTests(unittest.TestCase):
         self.assertEqual(service.tier()["testRunners"], ["pytest", "unittest", "npm", "go"])
 
     def test_ollama_metrics_convert_nanoseconds(self) -> None:
-        duration, load, rate = server.metrics_from_body(
-            {"total_duration": 2_700_000_000, "load_duration": 9_000_000_000, "eval_count": 64, "eval_duration": 10_000_000_000},
-            1,
+        duration, load, rate, note = server.metrics_from_body(
+            {
+                "total_duration": 2_700_000_000,
+                "load_duration": 9_000_000_000,
+                "eval_count": 64,
+                "eval_duration": 10_000_000_000,
+            },
+            5000,
             False,
         )
-        self.assertEqual(duration, 2700)
+        self.assertEqual(duration, 10000)
         self.assertEqual(load, 9000)
         self.assertEqual(rate, 6.4)
+        self.assertIsNone(note)
+        _duration, no_load, no_rate, missing = server.metrics_from_body(
+            {"usage": {"completion_tokens": 64}},
+            5000,
+            True,
+        )
+        self.assertIsNone(no_load)
+        self.assertIsNone(no_rate)
+        self.assertEqual(missing, "load time not reported")
+
+
+class RetryFeedbackTests(unittest.TestCase):
+    def _service(self, root: Path, generate, runner, memory=32.0):
+        repo = root / "repo"
+        (repo / "src").mkdir(parents=True)
+        (repo / "src" / "add.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+        (repo / "tests").mkdir()
+        (repo / "tests" / "test_add.py").write_text(
+            "import unittest\nclass T(unittest.TestCase):\n    def test_add(self):\n        self.assertEqual(add(1, 1), 2)\n",
+            encoding="utf-8",
+        )
+        ollama = FakeOllama([InstalledModel("qwen2.5-coder:14b", 14.2)])
+        ollama.generate = generate
+        service = Service(load_config(), lambda: memory, ollama, runner=runner, log_path=root / "log.jsonl", home=root)
+        service.env = {}
+        service.pytest_ok = True
+        return service, repo
+
+    def test_retry_prompt_includes_failures_and_source(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        calls = {"n": 0}
+
+        def generate(model, prompt, max_tokens, summary=False, temperature=0.1, timeout=None):
+            calls["n"] += 1
+            calls.setdefault("prompts", []).append(prompt)
+            calls.setdefault("temps", []).append(temperature)
+            return "class T(unittest.TestCase):\n    def test_add(self):\n        self.assertEqual(1, 2)\n# %s\n" % calls["n"]
+
+        def runner(argv, cwd, timeout, env):
+            if calls["n"] >= 2:
+                return CommandResult(0, "ok", "", False)
+            return CommandResult(
+                1,
+                "",
+                "FAIL: test_add (test_add.T)\nAssertionError: 1 != 2\n"
+                "Traceback (most recent call last):\n  File \"test_add.py\", line 4, in test_add\n"
+                "    self.assertEqual(1, 2)\nAssertionError: 1 != 2\n",
+                False,
+            )
+
+        service, repo = self._service(root, generate, runner)
+        result = service.job(
+            {
+                "instruction": "Write tests for add.",
+                "files": ["src/add.py", "tests/test_add.py"],
+                "targets": ["tests/test_add.py"],
+                "repo": str(repo),
+                "testCommand": ["python3", "-m", "unittest", "tests.test_add"],
+            }
+        )
+        self.assertTrue(result["ok"])
+        retry = calls["prompts"][1]
+        self.assertIn("Fix only the failing parts", retry)
+        self.assertIn("test_add", retry)
+        self.assertIn("AssertionError: 1 != 2", retry)
+        self.assertIn("Trimmed traceback", retry)
+        self.assertIn("Previous attempt code", retry)
+        self.assertIn("wrong assertion is your own bug", retry)
+        self.assertIn("def add(a, b):", retry)
+        self.assertIn("Module under test", retry)
+
+    def test_identical_output_stops_after_a_hotter_retry(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        temps = []
+
+        def generate(model, prompt, max_tokens, summary=False, temperature=0.1, timeout=None):
+            temps.append(temperature)
+            return "def add(a, b):\n    return 0\n"
+
+        def runner(argv, cwd, timeout, env):
+            return CommandResult(1, "", "FAIL: test_add\nAssertionError: 0 != 3\n", False)
+
+        service, repo = self._service(root, generate, runner)
+        result = service.job(
+            {
+                "instruction": "Fix add.",
+                "files": ["src/add.py"],
+                "targets": ["src/add.py"],
+                "repo": str(repo),
+                "testCommand": ["python3", "-m", "unittest", "tests.test_add"],
+            }
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["stopReason"], "identical_output")
+        self.assertEqual(result["tokensSaved"], 0)
+        self.assertGreater(result["tokensSpentLocal"], 0)
+        self.assertIn("test_add", result["failingTests"])
+        self.assertEqual(temps[:2], [0.1, 0.1])
+        self.assertEqual(temps[2], 0.7)
+        self.assertLess(len(temps), 5)
+
+    def test_generate_timeout_and_overall_budget(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        repo = root / "repo"
+        (repo / "src").mkdir(parents=True)
+        (repo / "src" / "add.py").write_text("x = 1\n", encoding="utf-8")
+        ollama = FakeOllama([InstalledModel("qwen2.5-coder:7b", 7.6)])
+
+        def generate(model, prompt, max_tokens, summary=False, temperature=0.1, timeout=None):
+            raise ServiceError("generation timed out", status=504, timed_out=True)
+
+        ollama.generate = generate
+        service = Service(load_config(), lambda: 4.0, ollama, home=root)
+        service.env = {}
+        service.pytest_ok = True
+        result = service.job(
+            {
+                "instruction": "Fix add.",
+                "files": ["src/add.py"],
+                "targets": ["src/add.py"],
+                "repo": str(repo),
+                "testCommand": ["python3", "-m", "unittest", "test_add"],
+            }
+        )
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["timedOut"])
+        self.assertEqual(result["stopReason"], "generate_timeout")
+
+        clock = {"t": 0.0}
+
+        def now():
+            return clock["t"]
+
+        def slow(model, prompt, max_tokens, summary=False, temperature=0.1, timeout=None):
+            clock["t"] += 1000
+            return "def add(a, b):\n    return 1\n"
+
+        ollama.generate = slow
+        cfg = load_config()
+        cfg["overallTimeoutSec"] = 30
+        service = Service(cfg, lambda: 4.0, ollama, runner=lambda *args: CommandResult(0, "", "", False), home=root, clock=now)
+        service.env = {}
+        service.pytest_ok = True
+        result = service.job(
+            {
+                "instruction": "Fix add.",
+                "files": ["src/add.py"],
+                "targets": ["src/add.py"],
+                "repo": str(repo),
+                "testCommand": ["python3", "-m", "unittest", "test_add"],
+            }
+        )
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["timedOut"])
+        self.assertEqual(result["stopReason"], "budget_exhausted")
+
+
+class ChoiceSaveTests(unittest.TestCase):
+    def test_setup_model_saves_when_the_model_is_already_present(self) -> None:
+        host = _FakeSetup("Darwin", "arm64", models=["qwen2.5-coder:14b"], always_healthy=True)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        home = Path(tmp.name)
+        project_install.perform_setup("ollama", home, host, model="qwen2.5-coder:14b")
+        self.assertEqual(host.commands, [])
+        self.assertEqual(host.spawned, [])
+        saved = json.loads(user_config_path(home, env={}).read_text(encoding="utf-8"))
+        self.assertEqual(saved["preferredModel"], "qwen2.5-coder:14b")
+
+    def test_setup_model_pulls_without_reinstalling(self) -> None:
+        host = _FakeSetup("Linux", "x86_64", models=[], always_healthy=True)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        home = Path(tmp.name)
+        project_install.perform_setup("ollama", home, host, model="qwen2.5-coder:14b")
+        joined = " ".join(" ".join(cmd) for cmd in host.commands)
+        self.assertNotIn("install.sh", joined)
+        self.assertNotIn("brew", joined)
+        self.assertEqual(host.commands[-1][-1], "qwen2.5-coder:14b")
+        self.assertEqual(host.commands[-1][1], "pull")
+
+    def test_set_model_only_writes_the_choice(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        home = Path(tmp.name)
+        project_install.perform_set_model(home, "qwen2.5-coder:7b", "fast")
+        saved = json.loads(user_config_path(home, env={}).read_text(encoding="utf-8"))
+        self.assertEqual(saved["preferredModel"], "qwen2.5-coder:7b")
+        self.assertEqual(saved["quality"], "fast")
+        with self.assertRaises(SystemExit):
+            project_install.perform_set_model(home, "not-a-model")
 
 
 if __name__ == "__main__":

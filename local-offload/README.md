@@ -95,7 +95,7 @@ Tags and sizes are pinned in `config.json`. If an installed model has a paramete
 
 State files `log.jsonl` and `config` (including `neverAsk`, `preferredModel`, and `quality`) live in `LOCAL_OFFLOAD_HOME`, or `stateDir` from `config.json`, or `~/.local-offload`.
 
-`python3 install.py --setup --model qwen2.5-coder:14b` or `--quality fast|balanced|best` saves that choice. When the hardware fits more than one model, `setup.ask` lists them, with `[recommended]` on the default.
+`python3 install.py --set-model qwen2.5-coder:14b` only saves `preferredModel`. It does not install a server or pull a model. `python3 install.py --setup --model <tag>` or `--quality fast|balanced|best` also saves the choice, and it installs or pulls only when that server or that model is missing. When the hardware fits more than one model, `setup.ask` lists them, with `[recommended]` on the default.
 
 ## Local test loop
 

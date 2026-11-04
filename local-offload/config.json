@@ -16,6 +16,7 @@
   "tightGb": {"7B": 6, "14B": 12, "32B": 24},
   "maxAttempts": 5,
   "attemptTimeoutSec": 120,
+  "generateTimeoutSec": 180,
   "overallTimeoutSec": 600,
   "localReadChars": 200000,
   "limits": {
