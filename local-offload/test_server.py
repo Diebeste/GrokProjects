@@ -43,6 +43,7 @@ from server import (
     decode_ollama_body,
     endpoint_list,
     load_config,
+    log_path_for,
     make_handler,
     ollama_chat_payload,
     parse_billion,
@@ -50,7 +51,9 @@ from server import (
     probe_backends,
     read_memory_gb,
     read_never_ask,
+    save_model_choice,
     select_rung,
+    state_dir,
     user_config_path,
     write_never_ask,
 )
@@ -139,10 +142,11 @@ class MemoryTests(unittest.TestCase):
         cases = [
             ("4096\n", "7B"),
             ("8191\n", "7B"),
-            ("8192\n", "14B"),
-            ("16384\n", "14B"),
-            ("16385\n", "32B"),
-            ("4096\n4096\n", "14B"),
+            ("8192\n", "7B"),
+            ("16384\n", "7B"),
+            ("24576\n", "14B"),
+            ("49152\n", "32B"),
+            ("4096\n4096\n", "7B"),
         ]
         for stdout, klass in cases:
             with self.subTest(stdout=stdout):
@@ -180,7 +184,7 @@ class MemoryTests(unittest.TestCase):
         )
         memory = read_memory_gb(host)
         self.assertAlmostEqual(memory, 8.0)
-        self.assertEqual(select_rung(memory, load_config())["parameterClass"], "14B")
+        self.assertEqual(select_rung(memory, load_config())["parameterClass"], "7B")
 
     def test_amd_read_failure_does_not_fall_through_to_ram(self) -> None:
         path = "/sys/class/drm/card0/device/mem_info_vram_total"
@@ -194,10 +198,10 @@ class MemoryTests(unittest.TestCase):
         cfg = load_config()
         cases = [
             (4194304, "7B"),
-            (8388608, "14B"),
-            (16777216, "14B"),
-            (16777217, "32B"),
-            (16387280, "14B"),
+            (8388608, "7B"),
+            (16777216, "7B"),
+            (25165824, "14B"),
+            (50331648, "32B"),
         ]
         for kib, klass in cases:
             with self.subTest(kib=kib):
@@ -246,9 +250,11 @@ class LadderTests(unittest.TestCase):
         cases = [
             (0, "7B", "function"),
             (7.999, "7B", "function"),
-            (8, "14B", "file"),
-            (16, "14B", "file"),
-            (16.001, "32B", "multifile"),
+            (8, "7B", "function"),
+            (16, "7B", "function"),
+            (23.9, "7B", "function"),
+            (24, "14B", "file"),
+            (48, "32B", "multifile"),
             (None, "7B", "function"),
             (float("nan"), "7B", "function"),
             (-0.1, "7B", "function"),
@@ -266,14 +272,14 @@ class LadderTests(unittest.TestCase):
             (1, 5.99, True, "qwen2.5-coder:7b"),
             (1, 9.0, False, None),
             (1, 9.01, True, "qwen2.5-coder:7b"),
-            (10, 12.0, False, None),
-            (10, 16.0, False, None),
-            (10, 11.9, True, "qwen2.5-coder:14b"),
-            (10, 16.01, True, "qwen2.5-coder:14b"),
-            (40, 30.0, False, None),
-            (40, 36.0, False, None),
-            (40, 29.9, True, "qwen2.5-coder:32b"),
-            (40, 70.0, True, "qwen2.5-coder:32b"),
+            (32, 12.0, False, None),
+            (32, 16.0, False, None),
+            (32, 11.9, True, "qwen2.5-coder:14b"),
+            (32, 16.01, True, "qwen2.5-coder:14b"),
+            (64, 30.0, False, None),
+            (64, 36.0, False, None),
+            (64, 29.9, True, "qwen2.5-coder:32b"),
+            (64, 70.0, True, "qwen2.5-coder:32b"),
         ]
         for memory, billion, needs_pull, pinned in cases:
             with self.subTest(memory=memory, billion=billion):
@@ -286,7 +292,7 @@ class LadderTests(unittest.TestCase):
             InstalledModel("other:14b", 14.0),
             InstalledModel("qwen2.5-coder:14b", 14.8),
         ]
-        name, pull = pick_model(select_rung(10, load_config()), installed)
+        name, pull = pick_model(select_rung(32, load_config()), installed)
         self.assertEqual((name, pull), ("qwen2.5-coder:14b", False))
 
     def test_tie_breaks_on_name(self) -> None:
@@ -294,12 +300,12 @@ class LadderTests(unittest.TestCase):
             InstalledModel("m-model:15b", 15.0),
             InstalledModel("a-model:13b", 13.0),
         ]
-        name, pull = pick_model(select_rung(10, load_config()), installed)
+        name, pull = pick_model(select_rung(32, load_config()), installed)
         self.assertEqual((name, pull), ("a-model:13b", False))
 
     def test_smaller_or_larger_installed_model_does_not_satisfy_the_rung(self) -> None:
         cfg = load_config()
-        name, pull = pick_model(select_rung(12, cfg), [InstalledModel("qwen2.5-coder:7b", 7.6)])
+        name, pull = pick_model(select_rung(32, cfg), [InstalledModel("qwen2.5-coder:7b", 7.6)])
         self.assertEqual((name, pull), ("qwen2.5-coder:14b", True))
         name, pull = pick_model(select_rung(4, cfg), [InstalledModel("qwen2.5-coder:32b", 32.8)])
         self.assertEqual((name, pull), ("qwen2.5-coder:7b", True))
@@ -322,7 +328,7 @@ class LadderTests(unittest.TestCase):
 
     def test_service_does_not_pull_when_the_model_is_missing(self) -> None:
         ollama = FakeOllama([])
-        service = Service(load_config(), lambda: 20.0, ollama)
+        service = Service(load_config(), lambda: 64.0, ollama)
         payload = service.tier()
         self.assertEqual(payload["slice"], "multifile")
         self.assertEqual(payload["model"], "qwen2.5-coder:32b")
@@ -334,7 +340,7 @@ class LadderTests(unittest.TestCase):
 
     def test_service_uses_an_installed_model_in_band(self) -> None:
         ollama = FakeOllama([InstalledModel("local-coder:14b", 14.2)])
-        service = Service(load_config(), lambda: 12.0, ollama)
+        service = Service(load_config(), lambda: 32.0, ollama)
         payload = service.tier()
         self.assertEqual(payload["model"], "local-coder:14b")
         self.assertEqual(payload["slice"], "file")
@@ -716,9 +722,11 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(setup["arch"], "arm64")
         self.assertEqual(setup["memoryGb"], 16)
         self.assertEqual(setup["recommended"]["server"], "ollama")
-        self.assertEqual(setup["recommended"]["model"], "qwen2.5-coder:14b")
-        self.assertEqual(setup["recommended"]["downloadGb"], 9)
-        self.assertEqual(setup["ask"], ask_sentence("ollama", "qwen2.5-coder:14b", 9))
+        self.assertEqual(setup["recommended"]["model"], "qwen2.5-coder:7b")
+        self.assertEqual(setup["recommended"]["downloadGb"], 4.7)
+        self.assertIn("Faster: qwen2.5-coder:7b (~4.7 GB, smoother on 16 GB) [recommended]", setup["ask"])
+        self.assertIn("Better quality: qwen2.5-coder:14b (~9 GB, slower, may swap on 16 GB)", setup["ask"])
+        self.assertTrue(setup["ask"].endswith("[yes / not now / never]"))
         self.assertFalse(setup["neverAsk"])
         self.assertEqual(setup["alternatives"][0]["server"], "mlx")
         self.assertIn("python3 install.py --setup", setup["commands"]["setup"])
@@ -1156,7 +1164,7 @@ class OllamaBinaryTests(unittest.TestCase):
             host,
             discover=lambda config: _NamedBackend("ollama", "ollama"),
         )
-        self.assertEqual(host.commands, [[str(binary), "pull", "qwen2.5-coder:14b"]])
+        self.assertEqual(host.commands, [[str(binary), "pull", "qwen2.5-coder:7b"]])
         self.assertEqual(host.spawned, [])
 
 
@@ -1169,8 +1177,8 @@ class SetupPayloadTests(unittest.TestCase):
         self.assertTrue(small["ask"].endswith("[yes / not now / never]"))
         self.assertEqual(small["ask"], ask_sentence("ollama", "qwen2.5-coder:7b", 4.7))
         mac = build_setup(cfg, "Darwin", "arm64", 32, False)
-        self.assertEqual(mac["recommended"]["model"], "qwen2.5-coder:32b")
-        self.assertEqual(mac["recommended"]["downloadGb"], 19)
+        self.assertEqual(mac["recommended"]["model"], "qwen2.5-coder:14b")
+        self.assertEqual(mac["recommended"]["downloadGb"], 9)
         self.assertEqual(mac["alternatives"][0]["server"], "mlx")
         self.assertEqual(mac["commands"]["setup"], "python3 install.py --setup")
         self.assertEqual(build_setup(cfg, "Darwin", "x86_64", 4, False)["alternatives"], [])
@@ -1231,6 +1239,7 @@ class LoopTests(unittest.TestCase):
         os.environ["SECRET_TOKEN"] = "super-secret"
         self.addCleanup(lambda: os.environ.pop("SECRET_TOKEN", None))
         service = Service(load_config(), lambda: 4.0, ollama, runner=runner, log_path=log)
+        service.pytest_ok = True
         result = service.job(
             {
                 "instruction": "Make add return the sum.",
@@ -1349,7 +1358,7 @@ class LoopTests(unittest.TestCase):
                 "repo": str(repo),
             }
         )
-        self.assertEqual(text, "short summary")
+        self.assertEqual(text.text, "short summary")
         self.assertIn("ERROR line", ollama.generated[0]["prompt"])
         self.assertTrue(ollama.generated[0]["summary"])
         self.assertEqual((repo / "logs" / "app.log").read_text(encoding="utf-8"), blob)
@@ -1373,6 +1382,241 @@ class Python39Tests(unittest.TestCase):
             text = (CONFIG_PATH.parent / name).read_text(encoding="utf-8")
             self.assertNotIn("import tomllib", text)
             self.assertNotIn("except*", text)
+
+
+class ChoiceAndStateTests(unittest.TestCase):
+    def test_sixteen_gb_offers_7b_and_14b_with_7b_recommended(self) -> None:
+        cfg = load_config()
+        payload = build_setup(cfg, "Darwin", "arm64", 16, False)
+        self.assertEqual(payload["recommended"]["model"], "qwen2.5-coder:7b")
+        notes = [choice["note"] for choice in payload["choices"]]
+        self.assertEqual(
+            notes,
+            [
+                "Faster: qwen2.5-coder:7b (~4.7 GB, smoother on 16 GB)",
+                "Better quality: qwen2.5-coder:14b (~9 GB, slower, may swap on 16 GB)",
+            ],
+        )
+        self.assertTrue(payload["choices"][0]["recommended"])
+        self.assertFalse(payload["choices"][1]["recommended"])
+        self.assertIn("[recommended]", payload["ask"])
+
+    def test_quality_and_preferred_model_override_the_default(self) -> None:
+        cfg = load_config()
+        best, _fits, recommended = server.resolve_choice(cfg, 16, {"quality": "best"})
+        self.assertEqual(recommended["tag"], "qwen2.5-coder:7b")
+        self.assertEqual(best["tag"], "qwen2.5-coder:14b")
+        fast, _fits, _recommended = server.resolve_choice(cfg, 16, {"quality": "fast"})
+        self.assertEqual(fast["tag"], "qwen2.5-coder:7b")
+        chosen, _fits, _recommended = server.resolve_choice(
+            cfg, 16, {"preferredModel": "qwen2.5-coder:14b", "quality": "fast"}
+        )
+        self.assertEqual(chosen["tag"], "qwen2.5-coder:14b")
+        tighter = dict(cfg)
+        tighter["comfortGb"] = dict(cfg["comfortGb"])
+        tighter["comfortGb"]["14B"] = 16
+        self.assertEqual(select_rung(16, tighter)["parameterClass"], "14B")
+
+    def test_saved_choice_is_what_tier_uses(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        home = Path(tmp.name)
+        path = user_config_path(home, env={})
+        save_model_choice(path, "qwen2.5-coder:14b", "best")
+        ollama = FakeOllama([InstalledModel("qwen2.5-coder:14b", 14.2)])
+        service = Service(load_config(), lambda: 16.0, ollama, home=home)
+        service.env = {}
+        payload = service.tier()
+        self.assertEqual(payload["model"], "qwen2.5-coder:14b")
+        self.assertEqual(payload["slice"], "file")
+        self.assertEqual(payload["recommendedModel"], "qwen2.5-coder:7b")
+        self.assertFalse(payload["needsPull"])
+
+    def test_state_dir_env_then_config_then_default(self) -> None:
+        home = Path("/Users/brand")
+        cfg = {"stateDir": "/tmp/from-config"}
+        self.assertEqual(state_dir(home, {}, {}), home / ".local-offload")
+        self.assertEqual(state_dir(home, cfg, {}), Path("/tmp/from-config"))
+        self.assertEqual(state_dir(home, cfg, {"LOCAL_OFFLOAD_HOME": "/tmp/from-env"}), Path("/tmp/from-env"))
+        self.assertEqual(user_config_path(home, env={}), home / ".local-offload" / "config")
+        self.assertEqual(log_path_for(home, env={"LOCAL_OFFLOAD_HOME": "/tmp/state"}), Path("/tmp/state") / "log.jsonl")
+
+    def test_tier_reprobes_instead_of_sticking_to_the_first_api(self) -> None:
+        calls = {"n": 0}
+
+        def discover():
+            calls["n"] += 1
+            backend = FakeOllama([InstalledModel("qwen2.5-coder:7b", 7.6)])
+            backend.api = "ollama" if calls["n"] == 1 else "openai"
+            return backend
+
+        service = Service(load_config(), lambda: 4.0, None, discover=discover)
+        service.env = {}
+        self.assertEqual(service.tier()["api"], "ollama")
+        self.assertEqual(service.tier()["api"], "openai")
+        self.assertEqual(calls["n"], 2)
+
+    def test_setup_quality_best_pulls_14b_and_saves_it(self) -> None:
+        host = _FakeSetup("Linux", "x86_64")
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        home = Path(tmp.name)
+        project_install.perform_setup("ollama", home, host, quality="best")
+        self.assertEqual(host.commands[-1][-1], "qwen2.5-coder:14b")
+        saved = json.loads(user_config_path(home, env={}).read_text(encoding="utf-8"))
+        self.assertEqual(saved["quality"], "best")
+        project_install.perform_setup("ollama", home, host, model="qwen2.5-coder:7b")
+        self.assertEqual(host.commands[-1][-1], "qwen2.5-coder:7b")
+        saved = json.loads(user_config_path(home, env={}).read_text(encoding="utf-8"))
+        self.assertEqual(saved["preferredModel"], "qwen2.5-coder:7b")
+        self.assertEqual(saved["quality"], "best")
+
+
+class SliceRunnerAndMetricsTests(unittest.TestCase):
+    def test_function_tier_rejects_two_targets(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        repo = Path(tmp.name) / "repo"
+        (repo / "src").mkdir(parents=True)
+        (repo / "src" / "a.py").write_text("a = 1\n", encoding="utf-8")
+        (repo / "src" / "b.py").write_text("b = 1\n", encoding="utf-8")
+        ollama = FakeOllama([InstalledModel("qwen2.5-coder:7b", 7.6)])
+        service = Service(load_config(), lambda: 16.0, ollama, home=Path(tmp.name))
+        service.env = {}
+        with self.assertRaises(JobError) as caught:
+            service.job(
+                {
+                    "instruction": "Update both helpers.",
+                    "files": ["src/a.py", "src/b.py"],
+                    "targets": ["src/a.py", "src/b.py"],
+                    "repo": str(repo),
+                    "testCommand": ["python3", "-m", "unittest", "tests"],
+                }
+            )
+        self.assertIn("exactly one target", str(caught.exception))
+        self.assertIn("function", str(caught.exception))
+        self.assertEqual(ollama.generated, [])
+        server.check_target_count("file", ["src/a.py"])
+        server.check_target_count("multifile", ["src/a.py", "src/b.py"])
+        with self.assertRaises(JobError) as file_tier:
+            server.check_target_count("file", ["src/a.py", "src/b.py"])
+        self.assertIn("file tier accepts exactly one target", str(file_tier.exception))
+
+    def test_text_response_headers_include_metrics(self) -> None:
+        class Timed(FakeOllama):
+            def generate(self, model, prompt, max_tokens, summary=False):
+                self.generated.append({"model": model, "prompt": prompt, "max_tokens": max_tokens})
+                return server.Generation("def add(a, b):\n    return a + b\n", 2700, 9000, 6.4)
+
+        ollama = Timed([InstalledModel("qwen2.5-coder:7b", 7.6)])
+        service = Service(load_config(), lambda: 4.0, ollama)
+        service.env = {}
+        result = service.job({"instruction": "Write add."})
+        self.assertIsInstance(result, server.TextResult)
+        self.assertEqual(result.meta["model"], "qwen2.5-coder:7b")
+        self.assertEqual(result.meta["backend"], "ollama")
+        self.assertEqual(result.meta["durationMs"], 2700)
+        self.assertEqual(result.meta["loadMs"], 9000)
+        self.assertEqual(result.meta["tokensPerSec"], 6.4)
+        self.assertEqual(result.meta["attempts"], 1)
+        self.assertIsInstance(result.meta["tokensSaved"], int)
+        httpd = LoopbackServer(("127.0.0.1", 0), make_handler(service))
+        port = httpd.server_address[1]
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(httpd.shutdown)
+        self.addCleanup(httpd.server_close)
+        for _ in range(50):
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                    break
+            except OSError:
+                time.sleep(0.02)
+        body = json.dumps({"instruction": "Write add."}).encode("utf-8")
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("POST", "/job", body=body, headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        data = resp.read()
+        self.assertEqual(resp.status, 200)
+        self.assertTrue(resp.getheader("Content-Type").startswith("text/plain"))
+        self.assertEqual(data, b"def add(a, b):\n    return a + b\n")
+        self.assertEqual(resp.getheader("X-Local-Offload-Model"), "qwen2.5-coder:7b")
+        self.assertEqual(resp.getheader("X-Local-Offload-Backend"), "ollama")
+        self.assertEqual(resp.getheader("X-Local-Offload-Duration-Ms"), "2700")
+        self.assertEqual(resp.getheader("X-Local-Offload-Load-Ms"), "9000")
+        self.assertEqual(resp.getheader("X-Local-Offload-Tokens-Per-Sec"), "6.4")
+        self.assertEqual(resp.getheader("X-Local-Offload-Attempts"), "1")
+        self.assertIsNotNone(resp.getheader("X-Local-Offload-Tokens-Saved"))
+        conn.close()
+
+    def test_missing_pytest_falls_back_for_unittest_and_errors_otherwise(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        repo = Path(tmp.name) / "repo"
+        (repo / "tests").mkdir(parents=True)
+        (repo / "tests" / "test_add.py").write_text(
+            "import unittest\nclass T(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n",
+            encoding="utf-8",
+        )
+        (repo / "src").mkdir()
+        (repo / "src" / "add.py").write_text("def add(a, b):\n    return 0\n", encoding="utf-8")
+        ollama = FakeOllama([InstalledModel("qwen2.5-coder:7b", 7.6)], "def add(a, b):\n    return a + b\n")
+        seen = {}
+
+        def runner(argv, cwd, timeout, env):
+            seen["argv"] = argv
+            return CommandResult(0, "ok", "", False)
+
+        service = Service(load_config(), lambda: 4.0, ollama, runner=runner, home=Path(tmp.name))
+        service.env = {}
+        service.pytest_ok = False
+        result = service.job(
+            {
+                "instruction": "Make add return the sum.",
+                "files": ["src/add.py", "tests/test_add.py"],
+                "targets": ["src/add.py"],
+                "repo": str(repo),
+                "testCommand": ["python3", "-m", "pytest", "tests/test_add.py"],
+            }
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(seen["argv"][:3], ["python3", "-m", "unittest"])
+        self.assertIn("test_add.py", seen["argv"])
+        plain = repo / "tests" / "test_plain.py"
+        plain.write_text("def test_add():\n    assert True\n", encoding="utf-8")
+        with self.assertRaises(JobError) as caught:
+            service.job(
+                {
+                    "instruction": "Make add return the sum.",
+                    "files": ["src/add.py"],
+                    "targets": ["src/add.py"],
+                    "repo": str(repo),
+                    "testCommand": ["python3", "-m", "pytest", "tests/test_plain.py"],
+                }
+            )
+        self.assertIn("pytest is not installed", str(caught.exception))
+        self.assertIn("unittest", str(caught.exception))
+
+    def test_tier_lists_unittest_and_pytest_when_present(self) -> None:
+        ollama = FakeOllama([InstalledModel("qwen2.5-coder:7b", 7.6)])
+        service = Service(load_config(), lambda: 4.0, ollama)
+        service.env = {}
+        service.pytest_ok = False
+        service.which = lambda name: None
+        self.assertEqual(service.tier()["testRunners"], ["unittest"])
+        service.pytest_ok = True
+        service.which = lambda name: "/usr/bin/" + name if name in ("npm", "go") else None
+        self.assertEqual(service.tier()["testRunners"], ["pytest", "unittest", "npm", "go"])
+
+    def test_ollama_metrics_convert_nanoseconds(self) -> None:
+        duration, load, rate = server.metrics_from_body(
+            {"total_duration": 2_700_000_000, "load_duration": 9_000_000_000, "eval_count": 64, "eval_duration": 10_000_000_000},
+            1,
+            False,
+        )
+        self.assertEqual(duration, 2700)
+        self.assertEqual(load, 9000)
+        self.assertEqual(rate, 6.4)
 
 
 if __name__ == "__main__":

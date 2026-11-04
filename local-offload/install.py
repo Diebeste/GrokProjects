@@ -284,8 +284,19 @@ def install_argv(system: str, which) -> list[str]:
     return list(LINUX_INSTALL)
 
 
-def recommended_model(config: dict, memory_gb, server_name: str) -> str:
-    rung = server.select_rung(memory_gb, config)
+def recommended_model(
+    config: dict,
+    memory_gb,
+    server_name: str,
+    model: str | None = None,
+    quality: str | None = None,
+) -> str:
+    preference = {}
+    if quality:
+        preference["quality"] = quality
+    if model:
+        preference["preferredModel"] = model
+    rung, _fits, _recommended = server.resolve_choice(config, memory_gb, preference or None)
     if server_name == "mlx":
         return str(rung["mlxTag"])
     return str(rung["tag"])
@@ -319,7 +330,13 @@ def start_ollama(host, binary: str) -> None:
         )
 
 
-def perform_setup(server_name: str, home: Path, host: LiveSetup | None = None) -> str:
+def perform_setup(
+    server_name: str,
+    home: Path,
+    host: LiveSetup | None = None,
+    model: str | None = None,
+    quality: str | None = None,
+) -> str:
     if server_name not in ("ollama", "mlx"):
         raise SystemExit("setup server must be ollama or mlx")
     host = host or LiveSetup()
@@ -327,14 +344,16 @@ def perform_setup(server_name: str, home: Path, host: LiveSetup | None = None) -
     if server_name == "mlx" and not (system == "Darwin" and host.arch() in ("arm64", "aarch64")):
         raise SystemExit("MLX setup is only for Apple Silicon")
     config = server.load_config()
-    model = recommended_model(config, host.memory_gb(), server_name)
+    if model or quality:
+        server.save_model_choice(server.user_config_path(home, config), model, quality)
+    model_tag = recommended_model(config, host.memory_gb(), server_name, model, quality)
     sys.stdout.write(f"setup: installing {server_name} for {system}\n")
     sys.stdout.flush()
     if server_name == "mlx":
         host.run([sys.executable, "-m", "pip", "install", "mlx-lm"])
-        sys.stdout.write(f"setup: pulling {model}\n")
+        sys.stdout.write(f"setup: pulling {model_tag}\n")
         sys.stdout.flush()
-        code = "from huggingface_hub import snapshot_download; snapshot_download(%r)" % model
+        code = "from huggingface_hub import snapshot_download; snapshot_download(%r)" % model_tag
         host.run([sys.executable, "-c", code])
         if not host.healthy("http://127.0.0.1:8080/v1/models"):
             host.spawn([sys.executable, "-m", "mlx_lm.server", "--host", "127.0.0.1", "--port", "8080"])
@@ -344,19 +363,27 @@ def perform_setup(server_name: str, home: Path, host: LiveSetup | None = None) -
         binary = find_ollama(host.which, host.is_file, host.home_dir(), host.localappdata())
         if not host.healthy(OLLAMA_HEALTH_URL):
             start_ollama(host, binary)
-        sys.stdout.write(f"setup: pulling {model}\n")
+        sys.stdout.write(f"setup: pulling {model_tag}\n")
         sys.stdout.flush()
-        host.run([binary, "pull", model])
+        host.run([binary, "pull", model_tag])
     return _verify_tier(home, host)
 
 
-def perform_pull(home: Path, host: LiveSetup | None = None, discover=None) -> None:
+def perform_pull(
+    home: Path,
+    host: LiveSetup | None = None,
+    discover=None,
+    model: str | None = None,
+    quality: str | None = None,
+) -> None:
     host = host or LiveSetup()
     config = server.load_config()
     found = (discover or server.discover_backend)(config)
     if found is None:
         raise SystemExit("no local backend found; run python3 install.py --setup only after the user says yes")
-    model = recommended_model(config, host.memory_gb(), found.name)
+    if model or quality:
+        server.save_model_choice(server.user_config_path(home, config), model, quality)
+    model = recommended_model(config, host.memory_gb(), found.name, model, quality)
     sys.stdout.write(f"setup: pulling {model} on {found.name}\n")
     sys.stdout.flush()
     if found.name == "mlx":
@@ -466,6 +493,8 @@ def main(argv: list[str] | None = None) -> None:
         help="install ollama (default) or mlx, then pull the recommended model. Only after the user says yes.",
     )
     parser.add_argument("--pull", action="store_true", help="pull the recommended model; do not install a server")
+    parser.add_argument("--model", help="model tag to pull and save as preferredModel")
+    parser.add_argument("--quality", choices=("fast", "balanced", "best"), help="fast, balanced, or best")
     parser.add_argument("--never", action="store_true", help="save the never-ask flag in ~/.local-offload/config")
     args = parser.parse_args(argv)
     supplied = list(sys.argv[1:] if argv is None else argv)
@@ -476,16 +505,20 @@ def main(argv: list[str] | None = None) -> None:
             raise SystemExit("pass either an install source or a setup command")
         if len(maintenance) > 1:
             raise SystemExit("pass only one of --never, --pull, or --setup")
+        if (args.model or args.quality) and not (args.setup is not None or args.pull):
+            raise SystemExit("pass --model or --quality with --setup or --pull")
         if args.never:
             path = server.user_config_path(home)
             server.write_never_ask(path)
             sys.stdout.write(f"saved never-ask flag to {path}\n")
             return
         if args.pull:
-            perform_pull(home)
+            perform_pull(home, model=args.model, quality=args.quality)
             return
-        perform_setup(str(args.setup), home)
+        perform_setup(str(args.setup), home, model=args.model, quality=args.quality)
         return
+    if args.model or args.quality:
+        raise SystemExit("pass --model or --quality with --setup or --pull")
     dest = install(
         args.repo,
         args.path,

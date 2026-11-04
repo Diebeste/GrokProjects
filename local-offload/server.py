@@ -9,6 +9,7 @@ It does not write the real repository, install a backend, or pull a model.
 from __future__ import annotations
 
 import glob
+import importlib.util
 import json
 import math
 import os
@@ -79,7 +80,22 @@ _OS_HINTS = {
     "Windows": "Windows: run the official Ollama installer from https://ollama.com/download/OllamaSetup.exe",
     "Linux": "Linux: run the official installer at https://ollama.com/install.sh",
 }
-_LOG_KEYS = ("ts", "kind", "attempt", "ok", "timedOut", "tokensSaved", "model", "backend")
+_LOG_KEYS = (
+    "ts",
+    "kind",
+    "attempt",
+    "ok",
+    "timedOut",
+    "tokensSaved",
+    "model",
+    "backend",
+    "durationMs",
+    "loadMs",
+    "tokensPerSec",
+)
+_DEFAULT_COMFORT_GB = {"7B": 8, "14B": 24, "32B": 48}
+_DEFAULT_TIGHT_GB = {"7B": 6, "14B": 12, "32B": 24}
+_QUALITIES = ("fast", "balanced", "best")
 
 
 class JobError(Exception):
@@ -133,12 +149,24 @@ def assert_loopback_url(url: str) -> None:
         raise SystemExit("backend host must be http://127.0.0.1")
 
 
-def user_config_path(home: Path) -> Path:
-    return home / ".local-offload" / "config"
+def state_dir(home: Path, config: dict | None = None, env: dict | None = None) -> Path:
+    current = os.environ if env is None else env
+    override = current.get("LOCAL_OFFLOAD_HOME")
+    if isinstance(override, str) and override.strip():
+        return Path(override).expanduser()
+    if config:
+        configured = config.get("stateDir")
+        if isinstance(configured, str) and configured.strip():
+            return Path(configured).expanduser()
+    return Path(home) / ".local-offload"
 
 
-def log_path_for(home: Path) -> Path:
-    return home / ".local-offload" / "log.jsonl"
+def user_config_path(home: Path, config: dict | None = None, env: dict | None = None) -> Path:
+    return state_dir(home, config, env) / "config"
+
+
+def log_path_for(home: Path, config: dict | None = None, env: dict | None = None) -> Path:
+    return state_dir(home, config, env) / "log.jsonl"
 
 
 def _validate_rung(rung: dict) -> None:
@@ -162,6 +190,15 @@ def _validate_rung(rung: dict) -> None:
         raise SystemExit("invalid config: mlxTag")
 
 
+def _validate_thresholds(config: dict, key: str, default: dict) -> None:
+    raw = config.get(key, default)
+    if not isinstance(raw, dict):
+        raise SystemExit(f"invalid config: {key}")
+    for name in ("7B", "14B", "32B"):
+        if not isinstance(raw.get(name), (int, float)):
+            raise SystemExit(f"invalid config: {key}.{name}")
+
+
 def _validate_prefixes(config: dict) -> None:
     prefixes = config.get("allowedTestPrefixes")
     if not isinstance(prefixes, list) or not prefixes:
@@ -181,8 +218,11 @@ def validate_config(config: dict) -> None:
         raise SystemExit("invalid config: bindHost is 127.0.0.1")
     if config.get("fallbackRung") != "7B":
         raise SystemExit("invalid config: fallback rung is 7B")
-    if config.get("lowBelowGb") != 8 or config.get("highAboveGb") != 16:
-        raise SystemExit("invalid config: memory boundaries are 8 and 16 GB")
+    state_dir_value = config.get("stateDir", "")
+    if not isinstance(state_dir_value, str):
+        raise SystemExit("invalid config: stateDir")
+    _validate_thresholds(config, "comfortGb", _DEFAULT_COMFORT_GB)
+    _validate_thresholds(config, "tightGb", _DEFAULT_TIGHT_GB)
     base_url = config.get("baseUrl", "")
     if not isinstance(base_url, str):
         raise SystemExit("invalid config: baseUrl")
@@ -269,15 +309,70 @@ def memory_failed(memory_gb: float | None) -> bool:
     return memory_gb < 0
 
 
-def select_rung(memory_gb: float | None, config: dict) -> dict:
+def _threshold_map(config: dict, key: str, default: dict) -> dict:
+    raw = config.get(key)
+    if not isinstance(raw, dict):
+        raw = default
+    return raw
+
+
+def classify_rungs(memory_gb: float | None, config: dict) -> tuple[list[dict], dict]:
+    fallback = rung_by_class(config, config["fallbackRung"])
     if memory_failed(memory_gb):
-        return rung_by_class(config, config["fallbackRung"])
+        return [{"rung": fallback, "fit": "fallback"}], fallback
     assert memory_gb is not None
-    if memory_gb < config["lowBelowGb"]:
-        return rung_by_class(config, "7B")
-    if memory_gb <= config["highAboveGb"]:
-        return rung_by_class(config, "14B")
-    return rung_by_class(config, "32B")
+    comfort = _threshold_map(config, "comfortGb", _DEFAULT_COMFORT_GB)
+    tight = _threshold_map(config, "tightGb", _DEFAULT_TIGHT_GB)
+    fits = []
+    for name in ("7B", "14B", "32B"):
+        rung = rung_by_class(config, name)
+        if memory_gb >= float(comfort.get(name, 10**9)):
+            fits.append({"rung": rung, "fit": "comfortable"})
+        elif memory_gb >= float(tight.get(name, 10**9)):
+            fits.append({"rung": rung, "fit": "tight"})
+    if not fits:
+        return [{"rung": fallback, "fit": "fallback"}], fallback
+    comfortable = [item for item in fits if item["fit"] == "comfortable"]
+    recommended = comfortable[-1]["rung"] if comfortable else fits[0]["rung"]
+    return fits, recommended
+
+
+def select_rung(memory_gb: float | None, config: dict) -> dict:
+    _fits, recommended = classify_rungs(memory_gb, config)
+    return recommended
+
+
+def rung_by_tag(config: dict, tag: str) -> dict | None:
+    for rung in config["rungs"]:
+        if rung["tag"] == tag or rung.get("mlxTag") == tag:
+            return rung
+    return None
+
+
+def rung_for_quality(fits: list[dict], recommended: dict, quality: str) -> dict:
+    if quality == "fast":
+        return fits[0]["rung"]
+    if quality == "best":
+        return fits[-1]["rung"]
+    return recommended
+
+
+def resolve_choice(config: dict, memory_gb: float | None, preference: dict | None) -> tuple[dict, list[dict], dict]:
+    fits, recommended = classify_rungs(memory_gb, config)
+    chosen = recommended
+    if preference:
+        quality = preference.get("quality")
+        if quality:
+            if quality not in _QUALITIES:
+                raise SystemExit("quality must be fast, balanced, or best")
+            chosen = rung_for_quality(fits, recommended, quality)
+        model = preference.get("preferredModel")
+        if model:
+            match = rung_by_tag(config, model)
+            if match is None:
+                raise SystemExit(f"unknown model {model}")
+            chosen = match
+    return chosen, fits, recommended
 
 
 def in_band(billion: float | None, rung: dict) -> bool:
@@ -312,6 +407,60 @@ def ask_sentence(server_name: str, model: str, download_gb: float) -> str:
         f"No local model found. Install {server_name} + {model} "
         f"(~{format_gb(download_gb)} GB)? [yes / not now / never]"
     )
+
+
+def option_note(rung: dict, fit: str, memory_gb: float | None, fastest: bool) -> str:
+    tag = rung["tag"]
+    download = format_gb(rung["downloadGb"])
+    ram = format_gb(memory_gb) if memory_gb is not None else "this"
+    if fastest and fit != "tight":
+        return f"Faster: {tag} (~{download} GB, smoother on {ram} GB)"
+    if fit == "tight":
+        return f"Better quality: {tag} (~{download} GB, slower, may swap on {ram} GB)"
+    return f"Better quality: {tag} (~{download} GB, fits in {ram} GB)"
+
+
+def _quality_name(index: int, count: int) -> str:
+    if count == 1:
+        return "balanced"
+    if index == 0:
+        return "fast"
+    if index == count - 1:
+        return "best"
+    return "balanced"
+
+
+def choice_rows(fits: list[dict], recommended: dict, memory_gb: float | None) -> list[dict]:
+    rows = []
+    count = len(fits)
+    for index, item in enumerate(fits):
+        rung = item["rung"]
+        rows.append(
+            {
+                "quality": "balanced" if count == 1 else _quality_name(index, count),
+                "model": rung["tag"],
+                "downloadGb": rung["downloadGb"],
+                "parameterClass": rung["parameterClass"],
+                "slice": rung["slice"],
+                "fit": item["fit"],
+                "recommended": rung["tag"] == recommended["tag"],
+                "note": option_note(rung, item["fit"], memory_gb, index == 0),
+            }
+        )
+    return rows
+
+
+def ask_with_choices(server_name: str, choices: list[dict], recommended: dict) -> str:
+    if len(choices) <= 1:
+        rung_model = recommended["tag"]
+        download = recommended["downloadGb"]
+        return ask_sentence(server_name, rung_model, download)
+    lines = [f"No local model found. Install {server_name}?"]
+    for choice in choices:
+        mark = " [recommended]" if choice["recommended"] else ""
+        lines.append(choice["note"] + mark)
+    lines.append("[yes / not now / never]")
+    return "\n".join(lines)
 
 
 def os_hint(system: str) -> str:
@@ -356,6 +505,39 @@ def write_never_ask(path: Path) -> None:
     path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 
+def read_preference(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    preference = {}
+    model = data.get("preferredModel")
+    quality = data.get("quality")
+    if isinstance(model, str) and model.strip():
+        preference["preferredModel"] = model.strip()
+    if quality in _QUALITIES:
+        preference["quality"] = quality
+    return preference
+
+
+def save_model_choice(path: Path, preferred_model: str | None, quality: str | None) -> None:
+    data: dict = {}
+    try:
+        current = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(current, dict):
+            data = current
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        data = {}
+    if preferred_model:
+        data["preferredModel"] = preferred_model
+    if quality:
+        data["quality"] = quality
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
 def build_setup(
     config: dict,
     system: str,
@@ -363,7 +545,8 @@ def build_setup(
     memory_gb: float | None,
     never_ask: bool,
 ) -> dict:
-    rung = select_rung(memory_gb, config)
+    fits, rung = classify_rungs(memory_gb, config)
+    choices = choice_rows(fits, rung, memory_gb)
     recommended = {
         "server": "ollama",
         "model": rung["tag"],
@@ -387,10 +570,11 @@ def build_setup(
         "arch": arch,
         "memoryGb": memory_gb,
         "recommended": recommended,
+        "choices": choices,
         "alternatives": alternatives,
         "hint": os_hint(system),
         "commands": display_commands(system, rung["tag"]),
-        "ask": None if never_ask else ask_sentence("ollama", rung["tag"], rung["downloadGb"]),
+        "ask": None if never_ask else ask_with_choices("ollama", choices, rung),
         "neverAsk": never_ask,
     }
 
@@ -565,6 +749,55 @@ def _message_text(content) -> str:
     return ""
 
 
+class Generation:
+    def __init__(
+        self,
+        text: str,
+        duration_ms: int,
+        load_ms: int | None = None,
+        tokens_per_sec: float | None = None,
+    ) -> None:
+        self.text = text
+        self.duration_ms = duration_ms
+        self.load_ms = load_ms
+        self.tokens_per_sec = tokens_per_sec
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, str):
+            return self.text == other
+        return NotImplemented
+
+
+class TextResult:
+    def __init__(self, text: str, meta: dict) -> None:
+        self.text = text
+        self.meta = meta
+
+
+def _ns_to_ms(value) -> int | None:
+    if isinstance(value, (int, float)) and value >= 0:
+        return int(value / 1e6)
+    return None
+
+
+def metrics_from_body(data: dict, wall_ms: int, openai: bool) -> tuple[int, int | None, float | None]:
+    if not openai:
+        load_ms = _ns_to_ms(data.get("load_duration"))
+        duration = _ns_to_ms(data.get("total_duration"))
+        rate = None
+        count = data.get("eval_count")
+        elapsed = data.get("eval_duration")
+        if isinstance(count, (int, float)) and isinstance(elapsed, (int, float)) and elapsed > 0:
+            rate = round(float(count) / (float(elapsed) / 1e9), 2)
+        return duration if duration is not None else wall_ms, load_ms, rate
+    rate = None
+    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    count = usage.get("completion_tokens")
+    if isinstance(count, (int, float)) and wall_ms > 0:
+        rate = round(float(count) / (wall_ms / 1000.0), 2)
+    return wall_ms, None, rate
+
+
 class BackendClient:
     def __init__(self, backend: Backend, fetch=None) -> None:
         assert_loopback_url(backend.base_url)
@@ -600,7 +833,8 @@ class BackendClient:
             found.append(InstalledModel(name=name, billion=billion))
         return found
 
-    def generate(self, model: str, prompt: str, max_tokens: int, summary: bool = False) -> str:
+    def generate(self, model: str, prompt: str, max_tokens: int, summary: bool = False) -> Generation:
+        started = time.monotonic()
         if self.api == "openai":
             data = self._post(
                 "/v1/chat/completions",
@@ -612,6 +846,7 @@ class BackendClient:
             choices = data.get("choices") if isinstance(data.get("choices"), list) else []
             message = choices[0].get("message") if choices and isinstance(choices[0], dict) else {}
             content = _message_text(message.get("content") if isinstance(message, dict) else "")
+            openai = True
         else:
             data = self._post(
                 "/api/chat",
@@ -624,9 +859,12 @@ class BackendClient:
                 raise ServiceError("generation failed", status=502)
             message = data.get("message") if isinstance(data.get("message"), dict) else {}
             content = message.get("content") if isinstance(message.get("content"), str) else ""
+            openai = False
         if not isinstance(content, str) or content == "":
             raise ServiceError("empty generation", status=502)
-        return content
+        wall_ms = max(0, int((time.monotonic() - started) * 1000))
+        duration_ms, load_ms, rate = metrics_from_body(data, wall_ms, openai)
+        return Generation(content, duration_ms, load_ms, rate)
 
     def _get(self, path: str, timeout: float) -> dict:
         return self._request("GET", path, None, timeout, "backend is not running", 503)
@@ -760,6 +998,66 @@ def _dangerous_arg(part: str) -> bool:
     if any(ch in part for ch in ("|", ";", "&", "`", "$", "\n", "\r", "<", ">")):
         return True
     return "://" in part
+
+
+def pytest_installed(finder=None) -> bool:
+    finder = importlib.util.find_spec if finder is None else finder
+    try:
+        return finder("pytest") is not None
+    except (ImportError, ValueError, AttributeError):
+        return False
+
+
+def available_test_runners(which, pytest_ok: bool) -> list[str]:
+    runners = []
+    if pytest_ok:
+        runners.append("pytest")
+    runners.append("unittest")
+    if which("npm"):
+        runners.append("npm")
+    if which("go"):
+        runners.append("go")
+    return runners
+
+
+def _is_pytest_argv(argv: list[str]) -> bool:
+    return len(argv) >= 3 and argv[1] == "-m" and argv[2] == "pytest"
+
+
+def unittest_compatible(text: str) -> bool:
+    return "unittest" in text and ("TestCase" in text or "import unittest" in text)
+
+
+def fallback_unittest_argv(rel: str) -> list[str]:
+    path = Path(rel)
+    parent = str(path.parent)
+    if parent in ("", "."):
+        parent = "."
+    return ["python3", "-m", "unittest", "discover", "-s", parent, "-p", path.name]
+
+
+def adjust_test_command(argv: list[str], repo: Path, pytest_ok: bool) -> list[str]:
+    if not _is_pytest_argv(argv) or pytest_ok:
+        return list(argv)
+    files = [part for part in argv[3:] if not part.startswith("-")]
+    if len(files) == 1:
+        try:
+            src = resolve_inside(repo, files[0])
+        except JobError:
+            src = None
+        if src is not None and src.is_file() and not src.is_symlink():
+            if unittest_compatible(src.read_text(encoding="utf-8", errors="replace")):
+                return fallback_unittest_argv(files[0])
+    raise JobError("pytest is not installed. Use python3 -m unittest, or install pytest.")
+
+
+def check_target_count(slice_name: str, targets: list[str]) -> None:
+    if slice_name == "multifile" or len(targets) == 1:
+        return
+    raise JobError(
+        f"the {slice_name} tier accepts exactly one target; got {len(targets)}. "
+        "Only the multifile tier accepts several."
+    )
 
 
 def command_allowed(argv, prefixes: list[list[str]]) -> bool:
@@ -961,9 +1259,12 @@ class Service:
         self.system = system
         self.arch = arch
         self.home = home
+        self.env = None
+        self.pytest_ok = None
+        self.which = shutil.which
         self.clock = clock or time.monotonic
         self._lock = threading.Lock()
-        self._tier: dict | None = None
+        self._injected = backend is not None
 
     def _log(self, record: dict) -> None:
         if self.log_path is None:
@@ -978,26 +1279,46 @@ class Service:
             sys.stderr.write(f"local-offload: memory read failed: {exc}\n")
             return None
 
+    def _state_home(self) -> Path:
+        if self.home is not None:
+            return self.home
+        return Path.home()
+
+    def _env(self) -> dict:
+        if self.env is not None:
+            return self.env
+        return os.environ
+
+    def _preference(self) -> dict:
+        return read_preference(user_config_path(self._state_home(), self.config, self._env()))
+
+    def _pytest_ok(self) -> bool:
+        if self.pytest_ok is not None:
+            return bool(self.pytest_ok)
+        return pytest_installed()
+
     def _missing(self) -> ServiceError:
         system = self.system if self.system else platform.system()
         arch = self.arch if self.arch else platform.machine()
-        home = self.home if self.home is not None else Path.home()
         setup = build_setup(
             self.config,
             system,
             arch,
             self._memory(),
-            read_never_ask(user_config_path(home)),
+            read_never_ask(user_config_path(self._state_home(), self.config, self._env())),
         )
         error = ServiceError("no local backend found", status=503)
         error.hint = setup["hint"]
         error.setup = setup
         return error
 
-    def _ensure_backend(self):
-        if self.backend is not None:
+    def _current_backend(self):
+        if self.discover is not None:
+            found = self.discover()
+        elif self._injected:
             return self.backend
-        found = self.discover() if self.discover is not None else discover_backend(self.config)
+        else:
+            found = discover_backend(self.config)
         if found is None:
             raise self._missing()
         if isinstance(found, Backend):
@@ -1007,27 +1328,27 @@ class Service:
 
     def tier(self) -> dict:
         with self._lock:
-            if self._tier is not None:
-                return dict(self._tier)
-            backend = self._ensure_backend()
-            rung = select_rung(self._memory(), self.config)
-            name, needs_pull = pick_model(rung, backend.list_models())
+            backend = self._current_backend()
+            memory = self._memory()
+            chosen, _fits, recommended = resolve_choice(self.config, memory, self._preference())
+            name, needs_pull = pick_model(chosen, backend.list_models())
             payload = {
                 "model": name,
-                "parameterClass": rung["parameterClass"],
-                "slice": rung["slice"],
-                "instruction": rung["instruction"],
+                "parameterClass": chosen["parameterClass"],
+                "slice": chosen["slice"],
+                "instruction": chosen["instruction"],
                 "backend": backend.name,
                 "api": backend.api,
                 "needsPull": needs_pull,
+                "recommendedModel": recommended["tag"],
+                "testRunners": available_test_runners(self.which, self._pytest_ok()),
             }
             if needs_pull:
                 payload["pull"] = "python3 install.py --pull"
                 return payload
             sys.stderr.write(
-                f"local-offload: {backend.name} {name} {rung['parameterClass']} slice={rung['slice']}\n"
+                f"local-offload: {backend.name} {name} {chosen['parameterClass']} slice={chosen['slice']}\n"
             )
-            self._tier = payload
             return dict(payload)
 
     def _require_model(self) -> dict:
@@ -1053,42 +1374,65 @@ class Service:
             return ""
         return read_local_text(self._repo(body), files, int(self.config["localReadChars"]))
 
+    def _coerce_generation(self, raw, started: float) -> Generation:
+        wall = max(0, int((time.monotonic() - started) * 1000))
+        if isinstance(raw, Generation):
+            if raw.duration_ms is None:
+                raw.duration_ms = wall
+            return raw
+        return Generation(str(raw), wall)
+
+    def _meta(self, tier: dict, attempts: int, saved: int, generation: Generation) -> dict:
+        return {
+            "model": tier["model"],
+            "backend": tier["backend"],
+            "durationMs": generation.duration_ms,
+            "loadMs": generation.load_ms,
+            "tokensPerSec": generation.tokens_per_sec,
+            "attempts": attempts,
+            "tokensSaved": saved,
+        }
+
     def job(self, body: dict):
         instruction, test, context = validate_job(body, self.config)
         if body.get("testCommand") is not None:
             return self.test_loop(body, instruction, test, context)
+        targets = _string_list(body.get("targets"), "targets") if "targets" in body else []
         tier = self._require_model()
+        if targets:
+            check_target_count(tier["slice"], targets)
         local = self._file_context(body)
         rung = rung_by_class(self.config, tier["parameterClass"])
         prompt = build_prompt(tier["slice"], instruction, test, context, local)
         summary = bool(body.get("files")) and not test
-        text = self.backend.generate(tier["model"], prompt, rung["maxTokens"], summary=summary)
-        saved = estimate_tokens(prompt + text)
-        self._log(
-            {
-                "kind": "generate",
-                "attempt": 1,
-                "ok": True,
-                "timedOut": False,
-                "tokensSaved": saved,
-                "model": tier["model"],
-                "backend": tier["backend"],
-            }
-        )
-        return text
+        started = time.monotonic()
+        raw = self.backend.generate(tier["model"], prompt, rung["maxTokens"], summary=summary)
+        generation = self._coerce_generation(raw, started)
+        saved = estimate_tokens(prompt + generation.text)
+        meta = self._meta(tier, 1, saved, generation)
+        self._log(self._attempt_record(1, True, False, saved, tier, generation))
+        return TextResult(generation.text, meta)
 
     def test_loop(self, body: dict, instruction: str, test: str, context: str) -> dict:
         argv = body.get("testCommand")
         if not command_allowed(argv, self.config["allowedTestPrefixes"]):
             raise JobError("test command is not allowed")
         repo = self._repo(body)
+        argv = adjust_test_command(list(argv), repo, self._pytest_ok())
+        if not command_allowed(argv, self.config["allowedTestPrefixes"]):
+            raise JobError("test command is not allowed")
         files = _string_list(body.get("files"), "files")
         targets = _string_list(body.get("targets"), "targets")
         if not targets:
             if len(files) == 1:
                 targets = list(files)
             else:
+                tier = self._require_model()
+                if tier["slice"] != "multifile":
+                    check_target_count(tier["slice"], files)
                 raise JobError("targets are required")
+        else:
+            check_target_count(self._require_model()["slice"], targets)
         for rel in files:
             src = resolve_inside(repo, rel)
             if src.is_symlink() or not src.is_file():
@@ -1109,6 +1453,8 @@ class Service:
         timed_out = False
         attempts = 0
         saved_total = 0
+        duration_total = 0
+        last_generation = Generation("", 0)
         tier = self._require_model()
         rung = rung_by_class(self.config, tier["parameterClass"])
         try:
@@ -1133,7 +1479,12 @@ class Service:
                 prompt = self._loop_prompt(
                     tier["slice"], instruction, test, context, targets, scratch, failure
                 )
-                text = self.backend.generate(tier["model"], prompt, rung["maxTokens"])
+                started_gen = self.clock()
+                raw = self.backend.generate(tier["model"], prompt, rung["maxTokens"])
+                generation = self._coerce_generation(raw, started_gen)
+                text = generation.text
+                last_generation = generation
+                duration_total += generation.duration_ms
                 saved = estimate_tokens(prompt + text)
                 saved_total += saved
                 try:
@@ -1144,7 +1495,7 @@ class Service:
                     last_output = "model output did not include the target files"
                     timed_out = False
                     failure = last_output
-                    self._log(self._attempt_record(attempt, False, False, saved, tier))
+                    self._log(self._attempt_record(attempt, False, False, saved, tier, generation))
                     continue
                 for rel, content in written.items():
                     dest = scratch / safe_relative(rel)
@@ -1154,23 +1505,17 @@ class Service:
                 if timeout <= 0:
                     timed_out = True
                     last_output = "overall time limit reached"
-                    self._log(self._attempt_record(attempt, False, True, saved, tier))
+                    self._log(self._attempt_record(attempt, False, True, saved, tier, generation))
                     break
                 result = self.runner(list(argv), scratch, timeout, scrub_env())
                 last_output = ((result.stdout or "") + (result.stderr or ""))[-8000:]
                 timed_out = bool(result.timed_out)
                 ok = result.code == 0 and not result.timed_out
-                self._log(self._attempt_record(attempt, ok, timed_out, saved, tier))
+                self._log(self._attempt_record(attempt, ok, timed_out, saved, tier, generation))
                 if ok:
-                    return {
-                        "ok": True,
-                        "attempts": attempt,
-                        "files": last_files,
-                        "testOutput": last_output,
-                        "report": None,
-                        "timedOut": False,
-                        "tokensSaved": saved_total,
-                    }
+                    return self._loop_result(
+                        True, attempt, last_files, last_output, None, False, saved_total, duration_total, tier, generation
+                    )
                 if result.timed_out:
                     failure = f"test timed out after {timeout:g} seconds\n{last_output}"
                 else:
@@ -1178,20 +1523,45 @@ class Service:
             report = f"failed after {attempts} attempts"
             if timed_out:
                 report += "; last attempt timed out"
-            return {
-                "ok": False,
-                "attempts": attempts,
-                "files": last_files,
-                "testOutput": last_output,
-                "report": report,
-                "timedOut": timed_out,
-                "tokensSaved": saved_total,
-            }
+            return self._loop_result(
+                False,
+                attempts,
+                last_files,
+                last_output,
+                report,
+                timed_out,
+                saved_total,
+                duration_total,
+                tier,
+                last_generation,
+            )
         finally:
             shutil.rmtree(scratch, ignore_errors=True)
 
-    def _attempt_record(self, attempt: int, ok: bool, timed_out: bool, saved: int, tier: dict) -> dict:
+    def _loop_result(
+        self, ok, attempts, files, test_output, report, timed_out, saved, duration_ms, tier, generation
+    ) -> dict:
+        meta = self._meta(tier, attempts, saved, generation)
+        meta["durationMs"] = duration_ms
         return {
+            "ok": ok,
+            "attempts": attempts,
+            "files": files,
+            "testOutput": test_output,
+            "report": report,
+            "timedOut": timed_out,
+            "model": meta["model"],
+            "backend": meta["backend"],
+            "durationMs": meta["durationMs"],
+            "loadMs": meta["loadMs"],
+            "tokensPerSec": meta["tokensPerSec"],
+            "tokensSaved": saved,
+        }
+
+    def _attempt_record(
+        self, attempt: int, ok: bool, timed_out: bool, saved: int, tier: dict, generation: Generation | None = None
+    ) -> dict:
+        record = {
             "kind": "attempt",
             "attempt": attempt,
             "ok": ok,
@@ -1199,7 +1569,15 @@ class Service:
             "tokensSaved": saved,
             "model": tier["model"],
             "backend": tier["backend"],
+            "durationMs": None,
+            "loadMs": None,
+            "tokensPerSec": None,
         }
+        if generation is not None:
+            record["durationMs"] = generation.duration_ms
+            record["loadMs"] = generation.load_ms
+            record["tokensPerSec"] = generation.tokens_per_sec
+        return record
 
     def _loop_prompt(self, slice_limit, instruction, test, context, targets, scratch, failure) -> str:
         parts = [build_prompt(slice_limit, instruction, test, context)]
@@ -1263,7 +1641,10 @@ def make_handler(service: Service):
                 self._error(exc)
                 return
             if isinstance(result, dict):
-                self._json(200, result)
+                self._json(200, result, _meta_headers(result))
+                return
+            if isinstance(result, TextResult):
+                self._text(200, result.text, _meta_headers(result.meta))
                 return
             self._text(200, result)
 
@@ -1310,18 +1691,20 @@ def make_handler(service: Service):
                 return None
             return body
 
-        def _json(self, status: int, payload: dict) -> None:
-            self._send(status, "application/json; charset=utf-8", json.dumps(payload).encode("utf-8"))
+        def _json(self, status: int, payload: dict, headers: list | None = None) -> None:
+            self._send(status, "application/json; charset=utf-8", json.dumps(payload).encode("utf-8"), headers)
 
-        def _text(self, status: int, text: str) -> None:
-            self._send(status, "text/plain; charset=utf-8", text.encode("utf-8"))
+        def _text(self, status: int, text: str, headers: list | None = None) -> None:
+            self._send(status, "text/plain; charset=utf-8", text.encode("utf-8"), headers)
 
-        def _send(self, status: int, content_type: str, body: bytes) -> None:
+        def _send(self, status: int, content_type: str, body: bytes, headers: list | None = None) -> None:
             self.close_connection = True
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Connection", "close")
+            for key, value in headers or []:
+                self.send_header(key, value)
             self.end_headers()
             self.wfile.write(body)
 
@@ -1329,6 +1712,23 @@ def make_handler(service: Service):
             sys.stderr.write("local-offload " + (fmt % args) + "\n")
 
     return Handler
+
+
+def _meta_headers(meta: dict) -> list[tuple[str, str]]:
+    if not isinstance(meta, dict) or "model" not in meta:
+        return []
+    headers = [
+        ("X-Local-Offload-Model", str(meta.get("model"))),
+        ("X-Local-Offload-Backend", str(meta.get("backend"))),
+        ("X-Local-Offload-Duration-Ms", str(meta.get("durationMs"))),
+        ("X-Local-Offload-Attempts", str(meta.get("attempts"))),
+        ("X-Local-Offload-Tokens-Saved", str(meta.get("tokensSaved"))),
+    ]
+    if meta.get("loadMs") is not None:
+        headers.append(("X-Local-Offload-Load-Ms", str(meta["loadMs"])))
+    if meta.get("tokensPerSec") is not None:
+        headers.append(("X-Local-Offload-Tokens-Per-Sec", str(meta["tokensPerSec"])))
+    return headers
 
 
 def warmup(service: Service) -> None:
@@ -1344,7 +1744,7 @@ def main() -> None:
     service = Service(
         config,
         lambda: read_memory_gb(HostInfo()),
-        log_path=log_path_for(Path.home()),
+        log_path=log_path_for(Path.home(), config),
     )
     try:
         httpd = LoopbackServer((config["bindHost"], int(config["port"])), make_handler(service))

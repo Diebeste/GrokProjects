@@ -81,13 +81,21 @@ Never install without the user's yes. `python3 install.py --pull` only downloads
 
 The service reads discrete GPU VRAM when it can: `nvidia-smi` total memory, or Linux AMD `mem_info_vram_total`. Otherwise it reads system RAM (`/proc/meminfo`, `sysctl hw.memsize`, or Windows CIM `TotalPhysicalMemory`). Figures are 1024-based GB, so 8192 MiB is 8 GB. A failed read uses the 7B tag and stops.
 
-| Memory | Class | Slice | Pinned tag | Download |
-| --- | --- | --- | --- | --- |
-| under 8 GB | 7B | function | `qwen2.5-coder:7b` | 4.7 GB |
-| 8–16 GB | 14B | file | `qwen2.5-coder:14b` | 9 GB |
-| above 16 GB | 32B | multifile | `qwen2.5-coder:32b` | 19 GB |
+The figure is discrete GPU VRAM when that is available, otherwise total RAM. A rung is comfortable only when memory clears `comfortGb` in `config.json` (7B at 8 GB, 14B at 24 GB, 32B at 48 GB). Between `tightGb` and that line the model can load but may swap, so it is offered as a choice and is not the default. On a 16 GB machine the recommended default is `qwen2.5-coder:7b`; `qwen2.5-coder:14b` is the better-quality option and may swap. Override the thresholds in `comfortGb` and `tightGb`. A saved `preferredModel` or `quality` (`fast`, `balanced`, `best`) in the state config wins over that default.
+
+| Memory | Recommended | Also offered |
+| --- | --- | --- |
+| under 24 GB | 7B function, `qwen2.5-coder:7b` (4.7 GB) | 14B when RAM is at least 12 GB |
+| 24–48 GB | 14B file, `qwen2.5-coder:14b` (9 GB) | 32B as a tight fit from 24 GB |
+| 48 GB and above | 32B multifile, `qwen2.5-coder:32b` (19 GB) | smaller rungs as the faster option |
 
 Tags and sizes are pinned in `config.json`. If an installed model has a parameter count in that rung's band, the service uses it. If several fit, the pinned tag wins when it is installed; otherwise the closest parameter count is used. If none fit, `/tier` sets `needsPull` and does not download anything. A backend that lists models with no parameter size in the id is used as-is.
+
+`/tier` is probed again on every call, so the API (`openai` or Ollama native) matches the backend as it is now. `POST /job` returns `model`, `backend`, `durationMs`, `loadMs` when known, `tokensPerSec` when known, `attempts`, and `tokensSaved` in JSON, and the same values as response headers for `text/plain`. The function and file tiers accept exactly one target. Only the multifile tier accepts several. `pytest` is used only when `importlib.util.find_spec("pytest")` succeeds; otherwise a unittest-style file falls back to `python3 -m unittest`, and any other pytest command returns a clear error. `/tier` lists `testRunners`.
+
+State files `log.jsonl` and `config` (including `neverAsk`, `preferredModel`, and `quality`) live in `LOCAL_OFFLOAD_HOME`, or `stateDir` from `config.json`, or `~/.local-offload`.
+
+`python3 install.py --setup --model qwen2.5-coder:14b` or `--quality fast|balanced|best` saves that choice. When the hardware fits more than one model, `setup.ask` lists them, with `[recommended]` on the default.
 
 ## Local test loop
 

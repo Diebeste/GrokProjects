@@ -40,7 +40,7 @@ If `setup.ask` is set, ask the user that exact string. It looks like:
 
 On Apple Silicon, mention MLX only when it is listed in `setup.alternatives`. Still ask `setup.ask`.
 
-- yes: `python3 install.py --setup` from `~/.local-offload`. Use `python3 install.py --setup mlx` only when the user chose MLX. The command prints progress and then checks `/tier`. Never install without the user's yes.
+- yes: `python3 install.py --setup` from `~/.local-offload`. If `setup.choices` lists more than one model, pass `--quality fast`, `--quality best`, or `--model <tag>` for the note they pick. The `[recommended]` line is the default. Use `python3 install.py --setup mlx` only when the user chose MLX. The command prints progress and then checks `/tier`. Never install without the user's yes.
 - not now: do this task yourself. Ask again next session. Do not write a flag.
 - never: `python3 install.py --never`, which saves `~/.local-offload/config`, then do the work yourself.
 

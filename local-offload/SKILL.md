@@ -36,7 +36,7 @@ If `setup.ask` is a string, ask the user that exact question. It has this form:
 
 On Apple Silicon, `setup.alternatives` may list MLX. You may mention that option. The question you ask is still `setup.ask`.
 
-- yes: from `~/.local-offload`, run `python3 install.py --setup` (or `python3 install.py --setup mlx` when they chose MLX). It prints progress, installs the official package for this OS, pulls the model, and verifies `GET /tier`. Never install without the user's yes.
+- yes: from `~/.local-offload`, run `python3 install.py --setup`. If `setup.choices` lists more than one model, ask which note they want, then pass `--quality fast`, `--quality best`, or `--model <tag>`. Use `python3 install.py --setup mlx` when they chose MLX. It prints progress, installs the official package for this OS, pulls the model, and verifies `GET /tier`. Never install without the user's yes. The `[recommended]` line is the default when they do not pick.
 - not now: do this task yourself. Do not save a flag. Ask again next session.
 - never: run `python3 install.py --never`. That writes `~/.local-offload/config` so later sessions do not ask. Then do the work yourself.
 
