@@ -1,9 +1,9 @@
 ---
-name: local-offload
+name: token-maxing
 description: "Offload boilerplate, scaffolding, mechanical edits, and summaries to the local service at 127.0.0.1:8765. Use when Codex already knows the slice, will apply the text, and will rerun the test once. If no local backend is running, ask before any install. Keep open-ended design, debugging, and security-sensitive work."
 ---
 
-# Local offload
+# Token Maxing
 
 You are Codex. You send one bounded slice to the local model, apply what comes back, and rerun the test you defined. You keep the repository, credentials, and files. Call the service with `curl` against loopback. There is no API key.
 

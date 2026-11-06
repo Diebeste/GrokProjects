@@ -1,9 +1,9 @@
 ---
-name: local-offload
+name: token-maxing
 description: "Offload boilerplate, scaffolding, mechanical edits, and summaries to the local service at 127.0.0.1:8765. Use when a small local model can do the slice and you will apply the result. If no local backend is running, ask before any install. Keep open-ended design, debugging, and security-sensitive work on the host."
 ---
 
-# Local offload
+# Token Maxing
 
 You spend fewer paid tokens by sending bounded work to the user's local model. You keep the repository, credentials, and the final apply. The service does not write the real repo.
 

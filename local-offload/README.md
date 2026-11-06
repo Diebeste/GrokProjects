@@ -1,4 +1,4 @@
-# Local offload
+# Token Maxing
 
 Loopback service that spends the user's local hardware on bounded work: boilerplate, test scaffolding, docstrings, mechanical edits, format conversions, and summaries of large files or logs. The Cursor or Codex host keeps open-ended design, debugging, and anything security-sensitive. It applies the result and reruns the test once.
 
@@ -20,7 +20,7 @@ With no arguments it clones `https://github.com/Diebeste/GrokProjects` and copie
 python3 install.py --path /path/to/local-offload
 ```
 
-It writes the service, config, tests, README, installer, and both skills to `~/.local-offload` (`/Users/macbookdesarai/.local-offload` on this Mac). It also copies the skills to `~/.cursor/skills/local-offload/SKILL.md` and `~/.codex/skills/local-offload/SKILL.md`. The installer prints the next commands.
+It writes the service, config, tests, README, installer, and both skills to `~/.local-offload` (`/Users/macbookdesarai/.local-offload` on this Mac). It also copies the skills to `~/.cursor/skills/token-maxing/SKILL.md` and `~/.codex/skills/token-maxing/SKILL.md`. The installer prints the next commands.
 
 The service never installs a backend and never pulls a model. Those commands run only when you pass them, and only after the user says yes:
 
@@ -111,16 +111,16 @@ A live smoke test sent a bounded add-function fix through the local service to M
 
 ## Skills
 
-Cursor follows `SKILL.md`. Copy that file to `~/.cursor/skills/local-offload/SKILL.md`.
+Cursor follows `SKILL.md`. Copy that file to `~/.cursor/skills/token-maxing/SKILL.md`.
 
-Codex follows `codex/SKILL.md`. Install it at `~/.codex/skills/local-offload/SKILL.md`:
+Codex follows `codex/SKILL.md`. Install it at `~/.codex/skills/token-maxing/SKILL.md`:
 
 ```bash
-mkdir -p ~/.codex/skills/local-offload
-cp codex/SKILL.md ~/.codex/skills/local-offload/SKILL.md
+mkdir -p ~/.codex/skills/token-maxing
+cp codex/SKILL.md ~/.codex/skills/token-maxing/SKILL.md
 ```
 
-Invoke it as `$local-offload`, or let Codex select it when a bounded slice should be drafted locally.
+Invoke it as `$token-maxing`, or let Codex select it when a bounded slice should be drafted locally.
 
 ## Tests
 

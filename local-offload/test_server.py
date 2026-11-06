@@ -876,8 +876,8 @@ class ContractTests(unittest.TestCase):
         self.assertIn("python3 server.py", readme)
         self.assertIn("https://ollama.com/install.sh", readme)
         self.assertIn("127.0.0.1:8765", readme)
-        self.assertIn("~/.cursor/skills/local-offload/SKILL.md", readme)
-        self.assertIn("~/.codex/skills/local-offload/SKILL.md", readme)
+        self.assertIn("~/.cursor/skills/token-maxing/SKILL.md", readme)
+        self.assertIn("~/.codex/skills/token-maxing/SKILL.md", readme)
 
     def test_codex_skill_contract(self) -> None:
         path = CONFIG_PATH.parent / "codex" / "SKILL.md"
@@ -888,7 +888,7 @@ class ContractTests(unittest.TestCase):
         for line in front.strip().splitlines():
             key, value = line.split(":", 1)
             fields[key.strip()] = value.strip().strip('"')
-        self.assertEqual(fields["name"], "local-offload")
+        self.assertEqual(fields["name"], "token-maxing")
         self.assertGreater(len(fields["description"]), 0)
         self.assertNotIn("\n", fields["description"])
         lowered = body.lower()
@@ -904,7 +904,7 @@ class ContractTests(unittest.TestCase):
         self.assertIn("do the work yourself", lowered)
         self.assertIn("open-ended design", lowered)
         cursor = (CONFIG_PATH.parent / "SKILL.md").read_text(encoding="utf-8")
-        self.assertIn("name: local-offload", cursor)
+        self.assertIn("name: token-maxing", cursor)
         self.assertNotEqual(text, cursor)
 
 
@@ -974,11 +974,11 @@ class InstallTests(unittest.TestCase):
         for rel in project_install.PAYLOAD:
             self.assertEqual((dest / rel).read_bytes(), (self.checkout / rel).read_bytes(), rel)
         self.assertEqual(
-            (self.home / ".cursor/skills/local-offload/SKILL.md").read_bytes(),
+            (self.home / ".cursor/skills/token-maxing/SKILL.md").read_bytes(),
             (self.checkout / "SKILL.md").read_bytes(),
         )
         self.assertEqual(
-            (self.home / ".codex/skills/local-offload/SKILL.md").read_bytes(),
+            (self.home / ".codex/skills/token-maxing/SKILL.md").read_bytes(),
             (self.checkout / "codex/SKILL.md").read_bytes(),
         )
         self.assertIn(f"cd {dest}", completed.stdout)

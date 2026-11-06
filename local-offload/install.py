@@ -54,11 +54,11 @@ def clone_dir(home: Path) -> Path:
 
 
 def cursor_skill(home: Path) -> Path:
-    return home / ".cursor" / "skills" / "local-offload" / "SKILL.md"
+    return home / ".cursor" / "skills" / "token-maxing" / "SKILL.md"
 
 
 def codex_skill(home: Path) -> Path:
-    return home / ".codex" / "skills" / "local-offload" / "SKILL.md"
+    return home / ".codex" / "skills" / "token-maxing" / "SKILL.md"
 
 
 def is_git_checkout(path: Path) -> bool:
