@@ -399,6 +399,30 @@ def pick_model(rung: dict, installed: list[InstalledModel]) -> tuple[str, bool]:
     return fitting[0].name, False
 
 
+def rung_for_model(config: dict, model: InstalledModel, fallback: dict) -> dict | None:
+    if model.billion is None:
+        return fallback
+    return next((rung for rung in config["rungs"] if in_band(model.billion, rung)), None)
+
+
+def model_options(config: dict, installed: list[InstalledModel], fallback: dict) -> list[dict]:
+    options = []
+    for model in installed:
+        rung = rung_for_model(config, model, fallback)
+        if rung is None:
+            continue
+        options.append(
+            {
+                "model": model.name,
+                "parameterClass": rung["parameterClass"],
+                "slice": rung["slice"],
+                "sizeB": model.billion,
+                "sizeKnown": model.billion is not None,
+            }
+        )
+    return options
+
+
 def format_gb(value: float) -> str:
     if float(value).is_integer():
         return str(int(value))
@@ -596,6 +620,11 @@ def build_prompt(slice_limit: str, instruction: str, test: str, context: str, lo
 def validate_job(body: dict, config: dict) -> tuple[str, str, str]:
     if not isinstance(body, dict):
         raise JobError("job must be a JSON object")
+    model = body.get("model")
+    if model is not None and (
+        not isinstance(model, str) or not model.strip() or len(model) > 256
+    ):
+        raise JobError("model must be an installed model name")
     limits = config["limits"]
     instruction = body.get("instruction")
     if not isinstance(instruction, str) or instruction.strip() == "":
@@ -1399,12 +1428,25 @@ class Service:
         self.backend = found
         return found
 
-    def tier(self) -> dict:
+    def tier(self, model_choice: str | None = None) -> dict:
         with self._lock:
             backend = self._current_backend()
             memory = self._memory()
             chosen, _fits, recommended = resolve_choice(self.config, memory, self._preference())
-            name, needs_pull = pick_model(chosen, backend.list_models())
+            installed = backend.list_models()
+            options = model_options(self.config, installed, chosen)
+            if model_choice is not None:
+                selected = next((model for model in installed if model.name == model_choice), None)
+                if selected is None:
+                    raise JobError("selected model is not installed")
+                selected_rung = rung_for_model(self.config, selected, chosen)
+                if selected_rung is None:
+                    raise JobError("selected model is outside the supported size tiers")
+                chosen = selected_rung
+                name = selected.name
+                needs_pull = False
+            else:
+                name, needs_pull = pick_model(chosen, installed)
             payload = {
                 "model": name,
                 "parameterClass": chosen["parameterClass"],
@@ -1414,6 +1456,7 @@ class Service:
                 "api": backend.api,
                 "needsPull": needs_pull,
                 "recommendedModel": recommended["tag"],
+                "modelOptions": options,
                 "testRunners": available_test_runners(self.which, self._pytest_ok()),
             }
             if needs_pull:
@@ -1424,11 +1467,15 @@ class Service:
             )
             return dict(payload)
 
-    def _require_model(self) -> dict:
-        payload = self.tier()
+    def _require_model(self, model_choice: str | None = None) -> dict:
+        payload = self.tier(model_choice)
         if payload.get("needsPull"):
             error = ServiceError("model is not installed", status=503)
-            error.extra = {"pull": "python3 install.py --pull", "model": payload["model"]}
+            error.extra = {
+                "pull": "python3 install.py --pull",
+                "model": payload["model"],
+                "modelOptions": payload.get("modelOptions", []),
+            }
             raise error
         return payload
 
@@ -1470,10 +1517,11 @@ class Service:
 
     def job(self, body: dict):
         instruction, test, context = validate_job(body, self.config)
+        model_choice = body.get("model")
         if body.get("testCommand") is not None:
             return self.test_loop(body, instruction, test, context)
         targets = _string_list(body.get("targets"), "targets") if "targets" in body else []
-        tier = self._require_model()
+        tier = self._require_model(model_choice)
         if targets:
             check_target_count(tier["slice"], targets)
         local = self._file_context(body)
@@ -1505,25 +1553,24 @@ class Service:
             raise JobError("test command is not allowed")
         files = _string_list(body.get("files"), "files")
         targets = _string_list(body.get("targets"), "targets")
+        tier = self._require_model(body.get("model"))
         if not targets:
             if len(files) == 1:
                 targets = list(files)
             else:
-                tier = self._require_model()
                 if tier["slice"] != "multifile":
                     check_target_count(tier["slice"], files)
                 raise JobError("targets are required")
-        else:
-            check_target_count(self._require_model()["slice"], targets)
+        check_target_count(tier["slice"], targets)
         for rel in files:
             src = resolve_inside(repo, rel)
             if src.is_symlink() or not src.is_file():
                 raise JobError(f"missing file {rel}")
         for rel in targets:
             safe_relative(rel)
-        return self._run_loop(repo, files, targets, argv, instruction, test, context)
+        return self._run_loop(repo, files, targets, argv, instruction, test, context, tier)
 
-    def _run_loop(self, repo, files, targets, argv, instruction, test, context) -> dict:
+    def _run_loop(self, repo, files, targets, argv, instruction, test, context, tier: dict) -> dict:
         max_attempts = int(self.config["maxAttempts"])
         attempt_timeout = float(self.config["attemptTimeoutSec"])
         generate_timeout = float(self.config.get("generateTimeoutSec", 180))
@@ -1544,7 +1591,6 @@ class Service:
         temperature = 0.1
         bumped = False
         last_hash = None
-        tier = self._require_model()
         rung = rung_by_class(self.config, tier["parameterClass"])
         try:
             if files:

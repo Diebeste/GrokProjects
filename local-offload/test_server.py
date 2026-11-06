@@ -362,6 +362,41 @@ class LadderTests(unittest.TestCase):
         self.assertFalse(payload["needsPull"])
         self.assertEqual(ollama.pulled, [])
 
+    def test_installed_model_options_can_override_a_missing_default(self) -> None:
+        model = "hf.co/bartowski/Mellum2.1-12B-A2.5B-Thinking-GGUF:Q5_K_M"
+        ollama = FakeOllama([InstalledModel(model, 12.1)])
+        service = Service(load_config(), lambda: 8.0, ollama)
+
+        payload = service.tier()
+        self.assertTrue(payload["needsPull"])
+        option = next(item for item in payload["modelOptions"] if item["model"] == model)
+        self.assertEqual(option["parameterClass"], "14B")
+        self.assertEqual(option["slice"], "file")
+        self.assertAlmostEqual(option["sizeB"], 12.1)
+
+        selected = service.tier(model)
+        self.assertEqual(selected["model"], model)
+        self.assertEqual(selected["parameterClass"], "14B")
+        self.assertEqual(selected["slice"], "file")
+        self.assertFalse(selected["needsPull"])
+        self.assertEqual(ollama.pulled, [])
+
+    def test_job_uses_selected_installed_model(self) -> None:
+        model = "hf.co/bartowski/Mellum2.1-12B-A2.5B-Thinking-GGUF:Q5_K_M"
+        ollama = FakeOllama([InstalledModel(model, 12.1)])
+        service = Service(load_config(), lambda: 8.0, ollama)
+        service.job({"instruction": "Write add.", "model": model})
+        self.assertEqual(ollama.generated[0]["model"], model)
+        self.assertEqual(ollama.generated[0]["max_tokens"], 4096)
+        self.assertEqual(ollama.pulled, [])
+
+    def test_job_rejects_a_model_that_is_not_installed(self) -> None:
+        ollama = FakeOllama([InstalledModel("qwen2.5-coder:7b", 7.6)])
+        service = Service(load_config(), lambda: 4.0, ollama)
+        with self.assertRaisesRegex(JobError, "selected model is not installed"):
+            service.job({"instruction": "Write add.", "model": "not-installed:14b"})
+        self.assertEqual(ollama.generated, [])
+
     def test_unsized_installed_model_is_used(self) -> None:
         ollama = FakeOllama([InstalledModel("local-model", None)])
         service = Service(load_config(), lambda: 4.0, ollama)
@@ -613,6 +648,8 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(payload["parameterClass"], "7B")
         self.assertEqual(payload["slice"], "function")
         self.assertFalse(payload["needsPull"])
+        self.assertIn("modelOptions", payload)
+        self.assertEqual(payload["modelOptions"][0]["model"], "qwen2.5-coder:7b")
         self.assertNotIn("\n", payload["instruction"])
         self.assertIn("one short function", payload["instruction"])
         status, _, _ = self.request("GET", "/tier?x=1")
@@ -641,6 +678,21 @@ class HttpTests(unittest.TestCase):
         self.assertNotIn("bash", prompt)
         self.assertEqual(self.ollama.generated[0]["model"], "qwen2.5-coder:7b")
         self.assertEqual(self.ollama.generated[0]["max_tokens"], 1024)
+        self.assertEqual(self.ollama.pulled, [])
+
+    def test_post_job_can_select_an_installed_model(self) -> None:
+        model = "hf.co/bartowski/Mellum2.1-12B-A2.5B-Thinking-GGUF:Q5_K_M"
+        self.ollama.models.append(InstalledModel(model, 12.1))
+        status, ctype, data = self.post({"instruction": "Write add.", "model": model})
+        self.assertEqual(status, 200)
+        self.assertTrue(ctype.startswith("text/plain"))
+        self.assertEqual(data, self.ollama.text.encode("utf-8"))
+        self.assertEqual(self.ollama.generated[0]["model"], model)
+        self.assertEqual(self.ollama.generated[0]["max_tokens"], 4096)
+        status, _, error = self.post({"instruction": "Write add.", "model": "not-installed:14b"})
+        self.assertEqual(status, 400)
+        self.assertIn(b"selected model is not installed", error)
+        self.assertEqual(len(self.ollama.generated), 1)
         self.assertEqual(self.ollama.pulled, [])
 
     def test_null_test_and_context_are_omitted(self) -> None:
@@ -900,6 +952,8 @@ class InstallTests(unittest.TestCase):
     def _run(self, *args: str) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env["HOME"] = str(self.home)
+        if os.name == "nt":
+            env["USERPROFILE"] = str(self.home)
         env["GIT_TERMINAL_PROMPT"] = "0"
         return subprocess.run(
             [sys.executable, str(CONFIG_PATH.parent / "install.py"), *args],
@@ -1003,7 +1057,7 @@ class InstallTests(unittest.TestCase):
         self.assertIn("qwen2.5-coder", body)
 
     def test_macos_opens_the_app_and_pulls_with_the_bundle_binary(self) -> None:
-        app = "/Applications/Ollama.app/Contents/Resources/ollama"
+        app = str(Path("/Applications/Ollama.app/Contents/Resources/ollama"))
         host = _FakeSetup("Darwin", "arm64", ollama_path=None, files=[app], healthy_after_open=True)
         project_install.perform_setup("ollama", self.home, host)
         self.assertIn("Ollama-darwin.zip", " ".join(host.commands[0]))
@@ -1012,7 +1066,7 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(host.spawned, [])
 
     def test_macos_falls_back_to_the_bundle_binary_when_open_fails(self) -> None:
-        app = "/Applications/Ollama.app/Contents/Resources/ollama"
+        app = str(Path("/Applications/Ollama.app/Contents/Resources/ollama"))
         host = _FakeSetup("Darwin", "arm64", ollama_path=None, files=[app], open_code=1)
         project_install.perform_setup("ollama", self.home, host)
         self.assertEqual(host.commands[1], ["open", "-a", "Ollama"])
@@ -1330,7 +1384,7 @@ class LoopTests(unittest.TestCase):
                 "files": ["src/add.py", "test_slow.py"],
                 "targets": ["src/add.py"],
                 "repo": str(repo),
-                "testCommand": ["python3", "-m", "unittest", "test_slow"],
+                "testCommand": ["python", "-m", "unittest", "test_slow"],
             }
         )
         self.assertLess(time.monotonic() - started, 8)

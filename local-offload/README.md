@@ -61,7 +61,7 @@ curl -sS http://127.0.0.1:8765/job \
   -d '{"instruction":"Write a Python function add(a, b) that returns the sum.","test":"add(1, 2) is 3"}'
 ```
 
-`GET /tier` returns JSON: `model`, `parameterClass`, `slice` (`function`, `file`, or `multifile`), `instruction`, `backend`, `api`, and `needsPull`. `POST /job` without `testCommand` returns the generated text only.
+GET /tier returns JSON with the selected model, parameter class, slice (function, file, or multifile), instruction, backend, API type, needsPull, and modelOptions. Each installed option includes its model name, supported slice, parameter class, and known size. POST /job accepts the exact installed model name in an optional model field; the service validates it and applies that model’s slice limit. Without testCommand, the endpoint returns generated text only.
 
 ## When no backend is running
 
@@ -104,6 +104,10 @@ Send `repo`, `files`, `targets`, and `testCommand` to run the loop. The service 
 `testCommand` is an argv array and must start with an allow-listed prefix: `python3 -m pytest`, `python3 -m unittest`, `python -m pytest`, `python -m unittest`, `npm test`, or `go test`. The process gets a scrubbed environment (no secrets copied in) and the arguments cannot contain shell operators or URLs.
 
 Each attempt is appended to `~/.local-offload/log.jsonl` with the attempt number and `tokensSaved` (about 4 characters per token of the local prompt and reply). The log does not store the prompt or the file text.
+
+## Verified local model run
+
+A live smoke test sent a bounded add-function fix through the local service to Mellum 2.1 Q5_K_M. The model returned a patch that passed the scratch unittest on the first attempt. On the tested RTX 4070 Laptop GPU, Ollama reported a 39% CPU / 61% GPU split; generation was about 40 seconds for that task. This is one observed run, not a general speed guarantee.
 
 ## Skills
 

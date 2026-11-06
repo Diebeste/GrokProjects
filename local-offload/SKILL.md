@@ -73,6 +73,10 @@ Read `slice`, `model`, `parameterClass`, `instruction`, and `needsPull` from the
 | `file` | One file |
 | `multifile` | One multi-file change |
 
+GET /tier also lists installed models in modelOptions, with each model's supported slice and parameter class. The default may need a pull even when another local model is installed.
+
+If the user requests a different installed model, or needsPull is true while modelOptions is non-empty, offer those exact model names and ask which one to use. For a selected option, add its exact name as the "model" field in the POST /job JSON. The service validates that the model is installed and applies the matching slice limit. If the user chooses an uninstalled recommendation, ask before pulling it; never download a model without the user's agreement.
+
 If `needsPull` is true, the backend is up and the model is missing. Run `python3 install.py --pull` only after the user agrees, then request `/tier` again. Do not pull on your own.
 
 If the task is larger than that slice, keep the rest and send one fitting slice, or do the whole task yourself.
