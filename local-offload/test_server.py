@@ -870,6 +870,10 @@ class ContractTests(unittest.TestCase):
         self.assertIn("python3 install.py --setup", skill)
         self.assertIn("do the work yourself", skill)
         self.assertIn("open-ended design", skill)
+        self.assertIn("ollama show <exact-name>", skill)
+        self.assertIn("never infer from a model name", skill)
+        self.assertIn("does not execute tool calls", skill)
+        self.assertIn("if thinking is required", skill)
 
     def test_readme_explains_run_and_install(self) -> None:
         readme = (CONFIG_PATH.parent / "README.md").read_text(encoding="utf-8")
@@ -903,6 +907,10 @@ class ContractTests(unittest.TestCase):
         self.assertIn("boilerplate", lowered)
         self.assertIn("do the work yourself", lowered)
         self.assertIn("open-ended design", lowered)
+        self.assertIn("ollama show <exact-name>", lowered)
+        self.assertIn("never infer from a model name", lowered)
+        self.assertIn("does not execute tool calls", lowered)
+        self.assertIn("if thinking is required", lowered)
         cursor = (CONFIG_PATH.parent / "SKILL.md").read_text(encoding="utf-8")
         self.assertIn("name: token-maxing", cursor)
         self.assertNotEqual(text, cursor)

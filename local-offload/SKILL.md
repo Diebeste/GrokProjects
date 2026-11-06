@@ -24,6 +24,10 @@ For a summary, pass the file path. The local model reads the big text. You read 
 
 Keep open-ended design, debugging, and anything security-sensitive on the host. Do not send secrets, tokens, or `.env` files.
 
+## When a task needs thinking or tool use
+
+Before offloading work that requires model thinking or tool use, tell the user which capability it needs and ask how to proceed. For Ollama, check each candidate in `modelOptions` with `ollama show <exact-name>` and read its Capabilities list; never infer from a model name. For other backends, rely only on documented capability metadata; treat unknown capabilities as unverified. If thinking is required, offer only verified installed models and pass the user's exact choice in the `model` field, or keep the work on the host. Ask before installing or pulling any model. Token Maxing returns text and does not execute tool calls, even when a model advertises `tools`; keep tasks that require the model to act through tools with the host agent.
+
 ## When no local model is running
 
 Request `GET http://127.0.0.1:8765/tier`.
