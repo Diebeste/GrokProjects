@@ -20,7 +20,7 @@ With no arguments it clones `https://github.com/Diebeste/GrokProjects` and copie
 python3 install.py --path /path/to/local-offload
 ```
 
-It writes the service, config, tests, README, installer, and both skills to `~/.local-offload` (`/Users/macbookdesarai/.local-offload` on this Mac). It also copies the skills to `~/.cursor/skills/token-maxing/SKILL.md` and `~/.codex/skills/token-maxing/SKILL.md`. The installer prints the next commands.
+It writes the service, config, tests, README, installer, and both skills to `~/.local-offload`. It also copies the skills to `~/.cursor/skills/token-maxing/SKILL.md` and `~/.codex/skills/token-maxing/SKILL.md`. The installer prints the next commands.
 
 The service never installs a backend and never pulls a model. Those commands run only when you pass them, and only after the user says yes:
 
@@ -121,6 +121,16 @@ cp codex/SKILL.md ~/.codex/skills/token-maxing/SKILL.md
 ```
 
 Invoke it as `$token-maxing`, or let Codex select it when a bounded slice should be drafted locally.
+
+## Field Test Learnings & Model Selection
+
+Empirical field testing across model families (`qwen2.5-coder:14b`, `qwen2.5-coder:7b`, `qwen3-vl:8b`, and DeepSeek speculative drafters) established critical operational guidelines:
+
+1. **Avoid Thinking Models for Fast Bounded Loops**: Models with `thinking: true` (such as `qwen3-vl:8b` or `deepseek-r1`) consume 1,000–2,000+ tokens on internal chain-of-thought, exhausting the standard 1,024-token budget and triggering `502 empty generation` errors. Pure instruction/coding models (`qwen2.5-coder`) generate direct solutions in ~2.8s without token waste.
+2. **Beware Speculative Drafter GGUFs**: Repositories containing only MTP/speculative drafters (e.g. `dflash`) fail standalone loading in Ollama/llama.cpp with `dflash requires ctx_other to be set`. Always verify that a model is a complete base architecture.
+3. **Domain Fit**: Application development (CRUD, schemas, validation) and reverse-engineering binary parsers (`struct.unpack`) achieve high pass rates in the self-healing test loop.
+
+Detailed benchmarks, failure traces, and mitigations are documented in [docs/field-test-learnings.md](docs/field-test-learnings.md).
 
 ## Tests
 
